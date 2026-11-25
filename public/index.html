@@ -3,231 +3,129 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <meta name="theme-color" content="#0e1014">
+  <meta name="theme-color" content="#151826">
   <title>TWO MINDS</title>
-  <meta name="description" content="二人のAIが自律的に会話し続ける観察型ゲーム">
+  <meta name="description" content="向かい合った二人のAIが、延々と話し続けるのを眺めるゲーム">
   <link rel="icon" href="icon.svg" type="image/svg+xml">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@500;600&family=Zen+Kaku+Gothic+New:wght@400;500;700&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@600&family=Zen+Maru+Gothic:wght@500;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
-<div class="app" id="app">
-
-  <!-- ===== ヘッダー ===== -->
+<div class="app">
   <header class="topbar">
-    <div class="brand">
-      <h1 class="title">TWO&nbsp;MINDS</h1>
-      <span class="mode-badge" id="modeBadge" hidden>DEMO</span>
-    </div>
-    <div class="stats">
-      <span class="status-pill" id="statusPill" data-state="idle"><span class="dot"></span><span id="statusText">未開始</span></span>
-      <span class="stat" title="経過時間"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/></svg><span id="elapsed">0:00</span></span>
-      <span class="stat" title="総発言数"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 6.5h14v9H10l-4 3v-3H5z"/></svg><span id="count">0</span></span>
-    </div>
-    <button class="icon-btn panel-toggle" id="panelToggle" aria-label="パネルを開く" aria-expanded="false" aria-controls="sidePanel">
-      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg>
-    </button>
+    <h1 class="title">TWO&nbsp;MINDS</h1>
+    <span class="mode-badge" id="modeBadge" hidden title="AI ではなく、決まった文型で会話しています">DEMO</span>
+    <span class="status" id="status" data-state="idle"><span class="dot"></span><span id="statusText">待機中</span></span>
   </header>
 
-  <!-- ===== メイン ===== -->
-  <main class="stage">
-    <section class="cast" aria-label="キャラクター">
-      <div class="char" id="charA" data-who="A">
-        <div class="avatar"><span class="initial" id="initialA">レ</span><span class="ring"></span></div>
-        <div class="char-meta">
-          <div class="char-name" id="nameA">レオ</div>
-          <div class="char-state" id="stateA">—</div>
-        </div>
-      </div>
-      <div class="bond" aria-hidden="true"><span class="bond-line" id="bondLine"></span><span class="bond-topic" id="topicLabel"></span></div>
-      <div class="char" id="charB" data-who="B">
-        <div class="char-meta right">
-          <div class="char-name" id="nameB">ミナ</div>
-          <div class="char-state" id="stateB">—</div>
-        </div>
-        <div class="avatar"><span class="initial" id="initialB">ミ</span><span class="ring"></span></div>
-      </div>
-    </section>
+  <main class="scene" id="scene">
+    <!-- 背景 -->
+    <div class="backdrop" aria-hidden="true">
+      <div class="window"><span class="moon"></span><span class="pane"></span></div>
+      <div class="lamp"></div>
+      <div class="floor"></div>
+      <svg class="table" viewBox="0 0 240 120">
+        <ellipse cx="120" cy="22" rx="110" ry="18" class="tbl-top"/>
+        <path d="M112 36 L106 120 M128 36 L134 120" class="tbl-leg"/>
+        <path d="M70 6 h22 v14 a11 6 0 0 1 -22 0z" class="cup"/>
+        <path d="M150 6 h22 v14 a11 6 0 0 1 -22 0z" class="cup"/>
+        <path class="steam" d="M78 0 q-4 -8 0 -14 q4 -6 0 -12"/>
+        <path class="steam s2" d="M160 0 q-4 -8 0 -14 q4 -6 0 -12"/>
+      </svg>
+    </div>
 
-    <section class="log-wrap">
-      <div class="log" id="log" role="log" aria-live="polite" aria-label="会話ログ">
-        <button class="load-older" id="loadOlder" hidden>それ以前の会話を表示</button>
-        <div id="logItems"></div>
-        <div class="typing" id="typing" hidden><span></span><span></span><span></span></div>
-        <div class="empty" id="emptyState">
-          <p class="empty-title">二人はまだ黙っている。</p>
-          <p class="empty-sub">「開始」を押すと、レオとミナが話し始めます。<br>あなたはその会話を、ただ眺めていても、ときどき口を挟んでもかまいません。</p>
-          <button class="btn primary" id="startBtnEmpty">会話を始める</button>
-        </div>
-      </div>
-      <button class="jump-latest" id="jumpLatest" hidden>新しい発言 ↓</button>
-    </section>
+    <!-- 吹き出し -->
+    <div class="bubbles" id="bubbles" aria-live="polite"></div>
 
-    <!-- ===== 下部操作 ===== -->
-    <footer class="controls">
-      <form class="composer" id="composer" autocomplete="off">
-        <div class="targets" role="radiogroup" aria-label="送信先">
-          <button type="button" role="radio" class="target active" data-target="both" aria-checked="true">二人へ</button>
-          <button type="button" role="radio" class="target" data-target="A" aria-checked="false" id="targetA">レオへ</button>
-          <button type="button" role="radio" class="target" data-target="B" aria-checked="false" id="targetB">ミナへ</button>
-          <button type="button" role="radio" class="target" data-target="topic" aria-checked="false">話題</button>
-        </div>
-        <div class="input-row">
-          <input id="input" type="text" maxlength="300" placeholder="二人に話しかける…" aria-label="メッセージ">
-          <button class="btn send" type="submit" id="sendBtn" aria-label="送信">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12l16-7-6 16-3-6.5z"/></svg>
-          </button>
-        </div>
-      </form>
-      <div class="buttons">
-        <button class="btn primary" id="playBtn"><span id="playLabel">開始</span></button>
-        <button class="btn" id="resetBtn">リセット</button>
-        <label class="speed">
-          <span>速度</span>
-          <select id="speedSelect" aria-label="会話速度">
-            <option value="slow">ゆっくり</option>
-            <option value="normal">ふつう</option>
-            <option value="fast">はやい</option>
-            <option value="instant">最速</option>
-          </select>
-        </label>
+    <!-- レオ（左） -->
+    <figure class="char" id="charA" data-who="A" data-expr="neutral" data-shape="neutral">
+      <svg class="figure" viewBox="0 0 200 260" aria-hidden="true">
+        <g class="body">
+          <path class="torso" d="M24 260 C26 206 58 186 100 186 C142 186 174 206 176 260 Z"/>
+          <path class="collar" d="M78 190 L100 214 L122 190"/>
+          <rect class="skin" x="89" y="158" width="22" height="32" rx="8"/>
+        </g>
+        <g class="head">
+          <path class="hair-back" d="M50 104 C46 54 78 40 104 42 C134 44 156 64 152 108 L146 96 L58 96 Z"/>
+          <ellipse class="skin ear" cx="56" cy="114" rx="8" ry="12"/>
+          <ellipse class="skin ear" cx="150" cy="114" rx="8" ry="12"/>
+          <ellipse class="skin face" cx="103" cy="112" rx="47" ry="53"/>
+          <path class="hair" d="M54 102 C52 60 84 44 110 46 C138 48 158 70 152 104 C144 88 132 76 116 72 C110 84 92 90 74 88 C66 90 58 96 54 102 Z"/>
+          <g class="cheeks"><ellipse cx="78" cy="132" rx="9" ry="5"/><ellipse cx="134" cy="132" rx="9" ry="5"/></g>
+          <g class="brows"><path class="brow l" d="M72 92 q10 -6 20 -1"/><path class="brow r" d="M116 91 q10 -5 20 1"/></g>
+          <g class="eyes"><ellipse class="eye l" cx="84" cy="112" rx="5" ry="6.5"/><ellipse class="eye r" cx="126" cy="112" rx="5" ry="6.5"/></g>
+          <g class="eyes-closed"><path d="M77 113 q7 -7 14 0"/><path d="M119 113 q7 -7 14 0"/></g>
+          <g class="glasses"><circle cx="84" cy="112" r="14"/><circle cx="126" cy="112" r="14"/><path d="M98 111 q7 -4 14 0"/></g>
+          <g class="mouth">
+            <path class="m m-neutral" d="M95 144 q9 2 18 0"/>
+            <path class="m m-smile" d="M92 141 q12 11 24 0"/>
+            <path class="m m-frown" d="M94 147 q10 -7 20 0"/>
+            <ellipse class="m m-o fill" cx="104" cy="146" rx="5" ry="6"/>
+            <path class="m m-mid fill" d="M94 142 q10 2 20 0 q-2 8 -10 8 q-8 0 -10 -8z"/>
+            <path class="m m-open fill" d="M93 140 q11 3 22 0 q-2 14 -11 14 q-9 0 -11 -14z"/>
+          </g>
+        </g>
+      </svg>
+      <figcaption class="nameplate">レオ</figcaption>
+    </figure>
+
+    <!-- ミナ（右） -->
+    <figure class="char" id="charB" data-who="B" data-expr="neutral" data-shape="neutral">
+      <svg class="figure" viewBox="0 0 200 260" aria-hidden="true">
+        <g class="body">
+          <path class="torso" d="M26 260 C28 208 60 188 100 188 C140 188 172 208 174 260 Z"/>
+          <path class="collar" d="M84 192 q16 14 32 0"/>
+          <rect class="skin" x="89" y="160" width="22" height="32" rx="8"/>
+        </g>
+        <g class="head">
+          <path class="hair-back" d="M44 150 C30 70 64 42 98 42 C134 42 168 70 154 150 C150 132 146 118 140 108 L60 108 C54 118 50 132 44 150 Z"/>
+          <ellipse class="skin ear" cx="52" cy="116" rx="7" ry="11"/>
+          <ellipse class="skin ear" cx="146" cy="116" rx="7" ry="11"/>
+          <ellipse class="skin face" cx="97" cy="114" rx="46" ry="52"/>
+          <path class="hair" d="M50 112 C44 62 74 46 98 46 C126 46 152 62 148 112 C144 96 136 84 126 80 C118 92 106 88 100 80 C92 90 78 92 66 86 C58 94 52 104 50 112 Z"/>
+          <path class="clip" d="M128 70 l12 -6 l3 6 l-12 6z"/>
+          <g class="cheeks"><ellipse cx="72" cy="134" rx="9" ry="5"/><ellipse cx="124" cy="134" rx="9" ry="5"/></g>
+          <g class="brows"><path class="brow l" d="M66 96 q9 -4 18 0"/><path class="brow r" d="M108 96 q9 -4 18 0"/></g>
+          <g class="eyes"><ellipse class="eye l" cx="76" cy="116" rx="5.5" ry="7"/><ellipse class="eye r" cx="116" cy="116" rx="5.5" ry="7"/></g>
+          <g class="eyes-closed"><path d="M69 117 q7 -7 14 0"/><path d="M109 117 q7 -7 14 0"/></g>
+          <g class="mouth">
+            <path class="m m-neutral" d="M88 146 q8 2 16 0"/>
+            <path class="m m-smile" d="M85 143 q11 11 22 0"/>
+            <path class="m m-frown" d="M87 149 q9 -6 18 0"/>
+            <ellipse class="m m-o fill" cx="96" cy="148" rx="5" ry="6"/>
+            <path class="m m-mid fill" d="M86 144 q10 2 20 0 q-2 8 -10 8 q-8 0 -10 -8z"/>
+            <path class="m m-open fill" d="M85 142 q11 3 22 0 q-2 14 -11 14 q-9 0 -11 -14z"/>
+          </g>
+        </g>
+      </svg>
+      <figcaption class="nameplate">ミナ</figcaption>
+    </figure>
+
+    <!-- 開始・一時停止時の案内 -->
+    <div class="overlay" id="overlay">
+      <div class="card">
+        <p class="card-title" id="overlayTitle">二人は、まだ黙っている。</p>
+        <p class="card-text" id="overlayText">理屈っぽいレオと、マイペースなミナ。<br>二人の会話を、ただ眺めていてください。ときどき口を挟んでもかまいません。</p>
+        <button class="btn primary" id="overlayBtn">会話をはじめる</button>
       </div>
-    </footer>
+    </div>
   </main>
 
-  <!-- ===== サイドパネル ===== -->
-  <aside class="panel" id="sidePanel" aria-label="詳細パネル">
-    <div class="panel-head">
-      <nav class="tabs" role="tablist">
-        <button role="tab" class="tab active" data-tab="relation" aria-selected="true">関係</button>
-        <button role="tab" class="tab" data-tab="memory" aria-selected="false">記憶</button>
-        <button role="tab" class="tab" data-tab="history" aria-selected="false">過去</button>
-        <button role="tab" class="tab" data-tab="persona" aria-selected="false">人格</button>
-        <button role="tab" class="tab" data-tab="settings" aria-selected="false">設定</button>
-      </nav>
-      <button class="icon-btn panel-close" id="panelClose" aria-label="パネルを閉じる">
-        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
+  <footer class="controls">
+    <form class="composer" id="composer" autocomplete="off">
+      <input id="input" type="text" maxlength="100" placeholder="二人に話しかける…" aria-label="二人へのメッセージ" enterkeyhint="send">
+      <button class="btn icon" type="submit" id="sendBtn" aria-label="送信">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12l16-7-6 16-3-6.5z"/></svg>
       </button>
-    </div>
-
-    <div class="panel-body">
-      <!-- 関係 -->
-      <section class="tabpane active" data-pane="relation">
-        <p class="pane-lead" id="relSummary"></p>
-        <div class="rel-grid">
-          <div class="rel-col"><h3 id="relTitleA">レオ → ミナ</h3><div id="relA"></div><p class="impression" id="impA"></p></div>
-          <div class="rel-col"><h3 id="relTitleB">ミナ → レオ</h3><div id="relB"></div><p class="impression" id="impB"></p></div>
-        </div>
-        <div class="rel-agree"><h3>意見の一致</h3><div id="relAgree"></div></div>
-        <p class="note">関係性は会話の内容に応じて少しずつ変化し、二人の言葉づかいや距離感に反映されます。</p>
-      </section>
-
-      <!-- 記憶 -->
-      <section class="tabpane" data-pane="memory" hidden>
-        <div class="pane-actions">
-          <select id="memFilter" aria-label="記憶の絞り込み">
-            <option value="all">すべて</option>
-          </select>
-          <button class="btn small" id="memNow">今すぐ記憶を整理</button>
-        </div>
-        <p class="note" id="memStatus"></p>
-        <div id="memList" class="mem-list"></div>
-      </section>
-
-      <!-- 過去 -->
-      <section class="tabpane" data-pane="history" hidden>
-        <input type="search" id="logSearch" class="search" placeholder="過去の発言を検索…" aria-label="過去の発言を検索">
-        <div id="searchResults" class="search-results"></div>
-        <h3 class="sub">思い出（エピソード）</h3>
-        <div id="episodeList" class="episodes"></div>
-      </section>
-
-      <!-- 人格 -->
-      <section class="tabpane" data-pane="persona" hidden>
-        <div class="persona-switch" role="radiogroup">
-          <button class="seg active" data-persona="A" id="personaTabA">レオ</button>
-          <button class="seg" data-persona="B" id="personaTabB">ミナ</button>
-        </div>
-        <form id="personaForm" class="persona-form">
-          <label>名前<input name="name" maxlength="20" required></label>
-          <label>性格<textarea name="personality" rows="4" maxlength="600"></textarea></label>
-          <label>話し方<textarea name="speech" rows="3" maxlength="400"></textarea></label>
-          <label>好きなもの<input name="likes" maxlength="300"></label>
-          <label>苦手なもの<input name="dislikes" maxlength="300"></label>
-          <label>背景・その他<textarea name="background" rows="3" maxlength="600"></textarea></label>
-          <div class="form-actions">
-            <button type="button" class="btn small ghost" id="personaDefault">初期設定に戻す</button>
-            <button type="submit" class="btn small primary">保存</button>
-          </div>
-          <p class="note">変更は次の発言から反映されます。相手の人格の詳細はもう一方には伝わりません。</p>
-        </form>
-      </section>
-
-      <!-- 設定 -->
-      <section class="tabpane" data-pane="settings" hidden>
-        <div class="setting">
-          <div><h3>会話モード</h3><p class="note" id="apiInfo"></p></div>
-          <div class="persona-switch" role="radiogroup">
-            <button class="seg" data-mode="ai" id="modeAi">AI</button>
-            <button class="seg" data-mode="demo" id="modeDemo">デモ</button>
-          </div>
-        </div>
-        <label class="setting check"><input type="checkbox" id="optInner"><span>心の声を表示する</span></label>
-        <label class="setting check"><input type="checkbox" id="optAutoPause"><span>画面を離れて5分たったら自動で一時停止（API 使用量の節約）</span></label>
-        <label class="setting">
-          <span>記憶を整理する間隔</span>
-          <select id="optMemEvery">
-            <option value="8">8発言ごと</option>
-            <option value="12">12発言ごと</option>
-            <option value="20">20発言ごと</option>
-          </select>
-        </label>
-        <div class="setting">
-          <span>使用量（このブラウザ）</span><span class="note" id="usageInfo"></span>
-        </div>
-        <h3 class="sub">データ</h3>
-        <div class="form-actions wrap">
-          <button class="btn small" id="exportBtn">書き出し（JSON）</button>
-          <label class="btn small file">読み込み<input type="file" id="importFile" accept="application/json" hidden></label>
-          <button class="btn small danger" id="wipeBtn">すべて初期化</button>
-        </div>
-        <p class="note">会話・人格・記憶・関係性・設定は、このブラウザに自動保存されます。</p>
-      </section>
-    </div>
-  </aside>
-  <div class="scrim" id="scrim" hidden></div>
+    </form>
+    <button class="btn icon" id="playBtn" aria-label="一時停止">
+      <svg viewBox="0 0 24 24" aria-hidden="true" class="i-pause"><path d="M8 5v14M16 5v14"/></svg>
+      <svg viewBox="0 0 24 24" aria-hidden="true" class="i-play"><path d="M7 5l12 7-12 7z"/></svg>
+    </button>
+  </footer>
 </div>
-
-<!-- ===== ダイアログ ===== -->
-<dialog id="setupDialog" class="dialog">
-  <h2>API キーが設定されていません</h2>
-  <p>二人の会話は Claude API によってその場で生成されます。サーバー側に API キーを設定してください。キーはブラウザには送られません。</p>
-  <ol class="steps">
-    <li><a href="https://console.anthropic.com/" target="_blank" rel="noopener">Anthropic Console</a> で API キーを発行する</li>
-    <li>プロジェクト直下で <code>.env.example</code> を <code>.env</code> にコピーする<pre><code>cp .env.example .env</code></pre></li>
-    <li><code>.env</code> の <code>ANTHROPIC_API_KEY=</code> にキーを書く</li>
-    <li>サーバーを再起動する<pre><code>npm start</code></pre></li>
-  </ol>
-  <div class="form-actions">
-    <button class="btn small ghost" id="setupDemo">デモモードで試す（AIではありません）</button>
-    <button class="btn small primary" id="setupRecheck">再確認</button>
-  </div>
-</dialog>
-
-<dialog id="resetDialog" class="dialog">
-  <h2>会話をリセット</h2>
-  <p>どこまで消しますか？ 人格の設定は残ります。</p>
-  <div class="form-actions column">
-    <button class="btn" id="resetLogOnly">会話ログだけ消す<small>記憶と関係性は残る。二人は以前のことを覚えている</small></button>
-    <button class="btn danger" id="resetAll">記憶・関係性も消す<small>二人は初対面に戻る</small></button>
-    <button class="btn ghost" id="resetCancel">キャンセル</button>
-  </div>
-</dialog>
-
-<div class="toast" id="toast" role="status" hidden></div>
-
 <script src="app.js" type="module"></script>
 </body>
 </html>
