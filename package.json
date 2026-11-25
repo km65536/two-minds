@@ -1,0 +1,24 @@
+{
+  "name": "two-minds",
+  "version": "0.1.0",
+  "description": "二人のAIが自律的に会話し続ける観察型ゲーム",
+  "private": true,
+  "type": "module",
+  "main": "server/index.mjs",
+  "scripts": {
+    "start": "node server/index.mjs",
+    "dev": "node --watch server/index.mjs",
+    "test": "node --test test/*.test.mjs"
+  },
+  "engines": {
+    "node": ">=20.12"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/km65536/two-minds.git"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@anthropic-ai/sdk": "^1.14.0"
+  }
+}
