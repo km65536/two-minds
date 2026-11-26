@@ -1,145 +1,173 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  buildTurnPrompt,
   buildSystemPrompt,
-  findDuplicate,
-  similarity,
-  analyze,
-  sanitizeLog,
+  buildEpisodePrompt,
   sanitizeContext,
-  normalizeTurn,
-  cleanUtterance,
-  renderTranscript,
+  sanitizeInterrupt,
+  normalizeEpisode,
+  salvageEpisode,
+  cleanText,
+  similarity,
   CHARACTERS,
-  RECENT_LIMIT,
+  EPISODE_SCHEMA,
+  EPISODE_MAX_LINES,
 } from '../server/conversation.mjs';
-import { demoTurn } from '../server/demo.mjs';
+import { demoEpisode } from '../server/demo.mjs';
 
-const say = (speaker, text, extra = {}) => ({ kind: 'say', speaker, text, intent: 'react', topic: '雨', answeredBy: [], ...extra });
-const player = (text, answeredBy = []) => ({ kind: 'player', text, answeredBy });
 const rng = (v) => () => v;
-const emptyCtx = { topics: [], notes: { A: [], B: [] } };
-
-test('personas: each prompt contains only its own character, both equally intelligent', () => {
-  const a = buildSystemPrompt('A');
-  const b = buildSystemPrompt('B');
-  assert.match(a, /あなたは「レオ」/);
-  assert.match(b, /あなたは「ミナ」/);
-  for (const line of CHARACTERS.A.core) assert.ok(a.includes(line) && !b.includes(line));
-  for (const line of CHARACTERS.B.core) assert.ok(b.includes(line) && !a.includes(line));
-  for (const p of [a, b]) {
-    assert.match(p, /どちらが上ということはありません/);
-    assert.match(p, /知らないことは知らないと言います/);
-    assert.match(p, /事実・推測・仮説を区別/);
-    assert.match(p, /間柄かは決まっていません/);
-    assert.match(p, /影響を受けてもかまいません/);
-  }
-  // 直感型も論理を使え、論理型も直感を持つ（固定的な役割にしない）
-  assert.match(CHARACTERS.A.balance, /根拠を確かめ/);
-  assert.match(CHARACTERS.B.balance, /直感的なひらめき/);
+const line = (speaker, text, extra = {}) => ({ speaker, text, expression: 'neutral', action: 'none', type: 'chat', phase: 'FREE', pause: 'none', ...extra });
+const episode = (lines, extra = {}) => ({
+  summary: 'テスト',
+  topic: 'お茶',
+  problem: { exists: false, question: '', kind: 'none', status: 'none', leo_view: '', mina_view: '', explored: [], conclusion: '', unresolved_reason: '', open_points: [] },
+  lines,
+  next: { hook: '', deferred_questions: [], continue_problem: false },
+  notes: { A: '', B: '' },
+  ...extra,
 });
 
-test('similarity / duplicate detection', () => {
-  assert.equal(similarity('今日はいい天気だね', '今日はいい天気だね'), 1);
-  const log = sanitizeLog([say('A', 'なぜ雨の音は落ち着くんだろう。理由が知りたい。')]);
-  assert.ok(findDuplicate('なぜ雨の音は落ち着くんだろう。理由が知りたいな。', log));
-  assert.equal(findDuplicate('パン屋の匂いの話をしよう', log), null);
+test('system prompt: both personas, equal intelligence, curiosity, plain language, phases and problem rules', () => {
+  const p = buildSystemPrompt();
+  for (const c of Object.values(CHARACTERS)) for (const t of c.traits) assert.ok(p.includes(t));
+  assert.match(p, /上下はない/);
+  assert.match(p, /いつもレオがとっぴで、いつもミナが正しい、という形にしない/);
+  assert.match(p, /分からないことは分からないと言う/);
+  assert.match(p, /関係.*決めない/);
+  assert.match(p, /難しい言葉/);
+  for (const ph of ['FREE', 'DISCOVERY', 'EXPLORATION', 'RESOLUTION', 'AFTERMATH']) assert.match(p, new RegExp(ph));
+  assert.match(p, /最後まで取り組む/);
+  assert.match(p, /deferred_questions に入れて後回し/);
+  assert.match(p, /正確さを最優先/);
+  assert.match(p, /でっち上げずに「未解決」/);
+  assert.match(p, /長さはあなたが決める/);
+  assert.match(p, /同意するだけの発言を続けない/);
+  assert.match(p, /無理に対立させない/);
+  assert.match(p, /観察者が答えを教えたら/);
 });
 
-test('only recent lines are kept, but topic flow and notes carry the thread', () => {
-  const many = Array.from({ length: 50 }, (_, i) => say(i % 2 ? 'B' : 'A', `発言${i}`));
-  const log = sanitizeLog(many);
-  assert.equal(log.length, RECENT_LIMIT);
-  assert.equal(log.at(-1).text, '発言49');
-  const ctx = sanitizeContext({ topics: [{ label: '雨の匂い', genre: 'nature' }, { label: '自由意志', genre: 'philosophy' }], notes: { A: ['ミナは定義にこだわる'], B: ['レオはたとえ話で逃げる'] } });
-  const pA = buildTurnPrompt({ speaker: 'A', log, ctx, rng: rng(0.5) });
-  assert.match(pA.user, /雨の匂い[\s\S]*自由意志/);
-  assert.match(pA.user, /前の話題に戻ってもかまいません/);
-  assert.match(pA.user, /ミナは定義にこだわる/);
-  assert.doesNotMatch(pA.user, /レオはたとえ話で逃げる/); // 相手のメモは見えない
+test('episode prompt: fresh start uses a random everyday opener and avoids recent topics', () => {
+  const ctx = sanitizeContext({ topics: ['靴下', '雲'] });
+  const p = buildEpisodePrompt({ ctx, rng: rng(0.1) });
+  assert.match(p.user, /最近話した話題.*靴下 \/ 雲/s);
+  assert.match(p.user, /始め方の例/);
+  assert.match(p.user, /あいさつから始めない/);
 });
 
-test('sanitizeContext caps sizes and rejects junk', () => {
-  const ctx = sanitizeContext({ topics: Array.from({ length: 30 }, (_, i) => ({ label: `t${i}`, genre: 'nope' })), notes: { A: ['x'.repeat(500)], B: 'bad' } });
-  assert.equal(ctx.topics.length, 10);
-  assert.equal(ctx.topics[0].genre, 'daily');
-  assert.equal(ctx.notes.A[0].length, 80);
-  assert.deepEqual(ctx.notes.B, []);
-  assert.deepEqual(sanitizeContext(null), emptyCtx);
+test('episode prompt: an unfinished problem is continued; backlog questions can come back', () => {
+  const ctx = sanitizeContext({ problem: { question: '夢はなぜ忘れるのか', status: 'continuing', leo_view: '消える', mina_view: '準備不足' }, backlog: ['洗濯物はなぜからまるのか'] });
+  const p = buildEpisodePrompt({ ctx, rng: rng(0.1) });
+  assert.match(p.user, /前回から続いている問題/);
+  assert.match(p.user, /夢はなぜ忘れるのか/);
+  assert.match(p.user, /レオの考え: 消える/);
+  const ctx2 = sanitizeContext({ backlog: ['洗濯物はなぜからまるのか'] });
+  assert.match(buildEpisodePrompt({ ctx: ctx2, rng: rng(0.1) }).user, /後回しにした疑問「洗濯物はなぜからまるのか」/);
 });
 
-test('first turn does not start with a greeting', () => {
-  const p = buildTurnPrompt({ speaker: 'A', log: [], rng: rng(0.5) });
-  assert.match(p.user, /会話の始まり/);
-  assert.match(p.user, /あいさつから入らず/);
+test('episode prompt: interrupt puts the observer first, with what was said and the hypotheses so far', () => {
+  const ctx = sanitizeContext({ recent: [{ kind: 'say', speaker: 'A', text: '前の話' }] });
+  const interrupt = sanitizeInterrupt({
+    text: '答えは静電気だよ',
+    played: [{ kind: 'say', speaker: 'A', text: 'なんで服がくっつくんだろう' }, { kind: 'say', speaker: 'B', text: '洗剤のせいかも' }],
+    problem: { question: '服がくっつく理由', leo_view: '服が仲良し', mina_view: '洗剤', status: 'exploring' },
+  });
+  const p = buildEpisodePrompt({ ctx, interrupt, rng: rng(0.5) });
+  assert.match(p.user, /たった今まで話していた会話[\s\S]*なんで服がくっつくんだろう[\s\S]*洗剤のせいかも/);
+  assert.match(p.user, /ミナの考え: 洗剤/);
+  assert.match(p.user, /観察者: 答えは静電気だよ/);
+  assert.match(p.user, /最初の発言は観察者への反応/);
+  assert.match(p.user, /答えを教えられたら/);
+  assert.doesNotMatch(p.user, /前の話/); // 割り込み時は、その時点までに再生された発言を使う
 });
 
-test('responds to the other; continuing own turn is allowed once', () => {
-  const p = buildTurnPrompt({ speaker: 'A', log: sanitizeLog([say('B', '雨の音って落ち着くよね')]), rng: rng(0.5) });
-  assert.match(p.user, /直前のミナの発言「雨の音って落ち着くよね」/);
-  const log = sanitizeLog([say('B', 'ねえ'), say('A', 'ちょっと思いついたんだけど')]);
-  const cont = buildTurnPrompt({ speaker: 'A', log, rng: rng(0.5) });
-  assert.match(cont.user, /自分の話を続けています/);
-  assert.match(cont.user, /after は pass/);
-  // 2 発言目で continue を返しても、3 連続にはさせない
-  assert.equal(normalizeTurn({ utterance: 'まだある', after: 'continue' }, cont.analysis).after, 'pass');
-  assert.equal(normalizeTurn({ utterance: 'まだある', after: 'continue' }, analyze(sanitizeLog([say('B', 'ねえ')]), 'A')).after, 'continue');
+test('sanitizers cap sizes and reject junk', () => {
+  const ctx = sanitizeContext({ history: Array(9).fill({ summary: 's' }), backlog: Array(20).fill('q'), recent: Array(50).fill({ kind: 'say', speaker: 'Z', text: 'x' }), problem: { question: '' } });
+  assert.equal(ctx.history.length, 3);
+  assert.equal(ctx.backlog.length, 5);
+  assert.equal(ctx.recent.length, 12);
+  assert.equal(ctx.recent[0].speaker, 'A');
+  assert.equal(ctx.problem, null);
+  assert.equal(sanitizeInterrupt({ text: '   ' }), null);
+  assert.equal(sanitizeInterrupt({ text: 'あ'.repeat(500) }).text.length, 100);
+  assert.deepEqual(sanitizeContext(null).notes, { A: [], B: [] });
 });
 
-test('silence is part of the transcript and invites a casual restart', () => {
-  const log = sanitizeLog([say('A', 'そういうことか'), { kind: 'pause' }]);
-  assert.match(renderTranscript(log), /（しばらく沈黙）/);
-  const p = buildTurnPrompt({ speaker: 'B', log, rng: rng(0.5) });
-  assert.match(p.user, /少し沈黙が続きました/);
+test('normalizeEpisode: fills defaults, drops broken lines and duplicates, clamps size', () => {
+  const ep = normalizeEpisode(
+    episode([
+      line('A', 'レオ: ねえ、お茶ぬるくなった', { expression: 'weird', action: 'fly', type: 'x', phase: 'Y', pause: 'z' }),
+      { speaker: 'C', text: '誰？' },
+      line('B', ''),
+      null,
+      line('B', 'ほんとだ'),
+      line('B', 'ほんとだ'),
+      line('A', '（笑いながら）なんでだろう'),
+    ]),
+  );
+  assert.equal(ep.lines.length, 3);
+  assert.deepEqual(ep.lines[0], { speaker: 'A', text: 'ねえ、お茶ぬるくなった', expression: 'neutral', action: 'none', type: 'chat', phase: 'FREE', pause: 'none' });
+  assert.equal(ep.lines[2].text, 'なんでだろう');
+  assert.equal(ep.problem.status, 'none');
+  const many = normalizeEpisode(episode(Array.from({ length: 80 }, (_, i) => line(i % 2 ? 'B' : 'A', `発言その${i}について話すと長くなるんだけど${'あいうえおかきくけこ'[i % 10]}`))));
+  assert.equal(many.lines.length, EPISODE_MAX_LINES);
+  assert.equal(normalizeEpisode(episode([line('A', 'ひとつだけ')])), null);
+  assert.equal(normalizeEpisode('nope'), null);
+  assert.equal(normalizeEpisode({}), null);
 });
 
-test('player: first responder reacts, second adds a view or returns; expires after three lines', () => {
-  const log = sanitizeLog([say('A', 'こんにちは'), player('好きな食べ物は？')]);
-  const first = buildTurnPrompt({ speaker: 'B', log, rng: rng(0.5) });
-  assert.match(first.user, /観察者が話しかけてきました: 「好きな食べ物は？」/);
-  const log2 = sanitizeLog([say('A', 'こんにちは'), player('好きな食べ物は？', ['B']), say('B', 'カレーかな')]);
-  const second = buildTurnPrompt({ speaker: 'A', log: log2, rng: rng(0.5) });
-  assert.match(second.user, /ミナがすでに反応しています/);
-  assert.match(second.user, /必ず答える必要はありません/);
-  const log3 = sanitizeLog([player('好きな食べ物は？'), say('B', 'カレー'), say('A', '僕はパン'), say('B', 'パンか')]);
-  assert.equal(analyze(log3, 'A').pendingPlayer.length, 0);
-  assert.match(renderTranscript(log3), /観察者: 好きな食べ物は？/);
+test('normalizeEpisode: lines repeating the previous episode are removed', () => {
+  const recent = [{ kind: 'say', speaker: 'A', text: '靴下が片方だけなくなるのはなぜだろう' }];
+  const ep = normalizeEpisode(episode([line('A', '靴下が片方だけなくなるのはなぜだろう'), line('B', '洗濯機かな'), line('A', 'かもね')]), { recent });
+  assert.equal(ep.lines.length, 2);
+  assert.equal(ep.lines[0].text, '洗濯機かな');
 });
 
-test('stagnation, closing, genre repetition and question habits are nudged', () => {
-  const log = sanitizeLog([say('A', 'うん'), say('B', 'そうだね'), say('A', 'ふむ'), say('B', 'へえ')]);
-  assert.ok(analyze(log, 'A').stagnant);
-  assert.match(buildTurnPrompt({ speaker: 'A', log, rng: rng(0.5) }).user, /停滞/);
-  const closing = sanitizeLog([say('A', 'じゃあ、このへんにしておこうか', { intent: 'closing' })]);
-  assert.match(buildTurnPrompt({ speaker: 'B', log: closing, rng: rng(0.5) }).user, /締めくくろう/);
-  const ctx = sanitizeContext({ topics: [{ label: 'a', genre: 'science' }, { label: 'b', genre: 'science' }, { label: 'c', genre: 'science' }] });
-  assert.match(buildTurnPrompt({ speaker: 'A', log: sanitizeLog([say('B', '量子の話の続き')]), ctx, rng: rng(0.5) }).user, /別のジャンルへ/);
-  const q = sanitizeLog([say('A', 'なんで？'), say('B', '理由はね'), say('A', '本当に？'), say('B', 'たぶん')]);
-  assert.match(buildTurnPrompt({ speaker: 'A', log: q, rng: rng(0.5) }).user, /質問で終わらないで/);
+test('normalizeEpisode: problem status, continuation and truncation', () => {
+  const p = { exists: true, question: 'なぜ？', kind: 'science', status: 'resolved', leo_view: 'a', mina_view: 'b', explored: [], conclusion: 'c', unresolved_reason: '', open_points: [] };
+  const lines = [line('A', 'まず一つ目の話'), line('B', 'それから二つ目の話')];
+  assert.equal(normalizeEpisode(episode(lines, { problem: p })).problem.status, 'resolved');
+  assert.equal(normalizeEpisode(episode(lines, { problem: p }), { truncated: true }).problem.status, 'continuing');
+  const cont = normalizeEpisode(episode(lines, { problem: { ...p, status: 'exploring' }, next: { hook: '', deferred_questions: ['次の疑問'], continue_problem: true } }));
+  assert.equal(cont.problem.status, 'continuing');
+  assert.equal(cont.next.continue_problem, true);
+  assert.deepEqual(cont.next.deferred_questions, ['次の疑問']);
+  assert.equal(normalizeEpisode(episode(lines, { problem: { ...p, question: '' } })).problem.exists, false);
 });
 
-test('sanitizeLog rejects junk and caps player length', () => {
-  const log = sanitizeLog([{ kind: 'evil', speaker: 'Z', text: 'x' }, null, { kind: 'player', text: 'あ'.repeat(500) }, { kind: 'say', text: '' }, { kind: 'pause', text: 'ignored' }]);
-  assert.equal(log.length, 3);
-  assert.equal(log[0].speaker, 'A');
-  assert.equal(log[1].text.length, 100);
-  assert.equal(log[2].kind, 'pause');
-  assert.equal(log[2].text, '');
+test('salvageEpisode: recovers complete lines from a truncated JSON (strings with braces and quotes)', () => {
+  const full = JSON.stringify(episode([line('A', '括弧 {こういうの} と "引用" があっても'), line('B', 'だいじょうぶ？'), line('A', 'ここで切れる')]));
+  const cut = full.slice(0, full.indexOf('ここで切れる') + 3);
+  const s = salvageEpisode(cut);
+  assert.equal(s.lines.length, 2);
+  assert.equal(s.lines[0].text, '括弧 {こういうの} と "引用" があっても');
+  assert.equal(s.summary, 'テスト');
+  assert.equal(s.problem.exists, false);
+  const ep = normalizeEpisode(s, { truncated: true });
+  assert.equal(ep.lines.length, 2);
+  assert.equal(ep.truncated, true);
+  assert.equal(salvageEpisode('{"summary":"x"'), null);
+  assert.equal(salvageEpisode(123), null);
 });
 
-test('normalizeTurn validates fields and strips name prefixes', () => {
-  const t = normalizeTurn({ utterance: 'レオ: 「なるほどね」', expression: 'weird', intent: 'nope', topic: 't', genre: 'x', after: 'y', tempo: 'z', note: ' メモ ' });
-  assert.deepEqual(t, { text: 'なるほどね', expression: 'neutral', intent: 'react', topic: 't', genre: 'daily', after: 'pass', tempo: 'normal', note: 'メモ' });
-  assert.equal(cleanUtterance('ミナ：ねえ'), 'ねえ');
+test('schema: problem is planned before lines; all fields required', () => {
+  assert.deepEqual(EPISODE_SCHEMA.propertyOrdering, ['summary', 'topic', 'problem', 'lines', 'next', 'notes']);
+  assert.deepEqual(EPISODE_SCHEMA.required, EPISODE_SCHEMA.propertyOrdering);
+  assert.equal(EPISODE_SCHEMA.properties.lines.maxItems, EPISODE_MAX_LINES);
 });
 
-test('demo mode answers the player and produces valid turns', () => {
-  const log = sanitizeLog([say('A', '宇宙って広いね'), player('こんばんは')]);
-  const t = demoTurn({ speaker: 'B', log, ctx: emptyCtx, rng: rng(0.1) });
-  assert.equal(t.intent, 'answer_player');
-  assert.ok(t.text.length > 0);
-  const first = demoTurn({ speaker: 'A', log: [], ctx: emptyCtx, rng: rng(0.3) });
-  assert.ok(first.text.length > 0);
-  assert.ok(['pass', 'continue', 'silence'].includes(first.after));
+test('cleanText and similarity', () => {
+  assert.equal(cleanText('ミナ：「そうだね」'), 'そうだね');
+  assert.equal(cleanText('  改行\nも 消す '), '改行 も 消す');
+  assert.ok(similarity('今日はいい天気だね', '今日はいい天気だね') === 1);
+});
+
+test('demo episodes are valid scripts and react to the observer', () => {
+  const ctx = sanitizeContext({});
+  const ep = demoEpisode({ ctx, interrupt: null });
+  assert.ok(ep.lines.length >= 2);
+  for (const l of ep.lines) assert.ok(['A', 'B'].includes(l.speaker) && l.text);
+  const r = demoEpisode({ ctx, interrupt: sanitizeInterrupt({ text: 'こんばんは', problem: { question: '夢はなぜ忘れるのか' } }) });
+  assert.match(r.lines[0].text, /こんばんは/);
+  assert.equal(r.lines[0].type, 'answer_player');
+  assert.equal(r.problem.status, 'continuing');
 });

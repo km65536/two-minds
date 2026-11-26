@@ -88,11 +88,12 @@ export class Limiter {
   }
 
   /** 1 リクエスト（＝1 発言）の開始時に呼ぶ。最小間隔と同時実行数を確認する。 */
-  begin(ip) {
+  begin(ip, { interrupt = false } = {}) {
     const now = this.clock();
     this.rollover(now);
     const s = this.ipState(ip, now);
-    if (s.last && now - s.last < this.o.ipMinIntervalMs) {
+    // 観察者の割り込みは最優先なので、最小間隔の制限はかけない（1 分・1 日の回数の上限は通常どおり）
+    if (!interrupt && s.last && now - s.last < this.o.ipMinIntervalMs) {
       throw new AIError('too_fast', 'リクエストの間隔が短すぎます。', { status: 429, retryable: true });
     }
     if (this.inFlight >= this.o.maxConcurrent) {

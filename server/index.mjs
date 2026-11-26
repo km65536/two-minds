@@ -15,16 +15,16 @@ try {
   /* .env が無い場合は環境変数のみを使う */
 }
 
-const { generateTurn, hasCredentials, getConfig, AIError } = await import('./ai.mjs');
-const { demoTurn } = await import('./demo.mjs');
-const { sanitizeLog, sanitizeContext, PLAYER_MAX } = await import('./conversation.mjs');
+const { generateEpisode, hasCredentials, getConfig, AIError, SupersededError } = await import('./ai.mjs');
+const { demoEpisode } = await import('./demo.mjs');
+const { sanitizeContext, sanitizeInterrupt, PLAYER_MAX } = await import('./conversation.mjs');
 const { Limiter, limitsFromEnv, UpstreamGate, isUpstreamTransient } = await import('./limits.mjs');
 
 const PUBLIC_DIR = path.join(root, 'public');
 const PORT = Number(process.env.PORT) || 3000;
 // Render では外部から届くよう 0.0.0.0 で待ち受ける。ローカルでは自分の PC からのみ。
 const HOST = process.env.HOST || (process.env.RENDER ? '0.0.0.0' : '127.0.0.1');
-const MAX_BODY = 24 * 1024;
+const MAX_BODY = 48 * 1024;
 const AI_ENABLED = (process.env.AI_ENABLED ?? 'true').toLowerCase() !== 'false';
 const limiter = new Limiter(limitsFromEnv());
 const gate = new UpstreamGate({
@@ -99,6 +99,13 @@ function clientIp(req) {
   return req.socket.remoteAddress || 'unknown';
 }
 
+/** タブごとの識別子（同じタブからの生成が重ならないようにするため。中身は乱数で、個人情報ではない） */
+const inflight = new Map(); // session -> AbortController
+function sessionId(req) {
+  const v = req.headers['x-two-minds-session'];
+  return typeof v === 'string' && /^[a-z0-9-]{8,64}$/i.test(v) ? `s:${v}` : `ip:${clientIp(req)}`;
+}
+
 /** 他サイトのページから API を呼ばせないための確認 */
 function checkCaller(req) {
   if (req.headers['x-two-minds'] !== '1') throw new AIError('forbidden', '許可されていない呼び出しです。', { status: 403 });
@@ -124,28 +131,40 @@ async function handleApi(req, res, url) {
       playerMax: PLAYER_MAX,
       // クライアントが自分で間隔を調整し、上限にぶつからないようにするための目安
       pace: { perMinute: limiter.o.ipRpmLimit, minIntervalMs: limiter.o.ipMinIntervalMs },
+      maxLines: 36,
     });
   }
 
-  if (url.pathname === '/api/turn' && req.method === 'POST') {
+  // 一連の会話記録（エピソード）をまとめて生成する。発言ごとの通信はしない
+  if (url.pathname === '/api/episode' && req.method === 'POST') {
     checkCaller(req);
     const body = await readJSON(req);
-    const speaker = body.speaker === 'B' ? 'B' : 'A';
-    const log = sanitizeLog(body.log);
     const ctx = sanitizeContext(body.context);
-    if (body.mode === 'demo') return send(res, 200, { ...demoTurn({ speaker, log, ctx }), demo: true });
+    const interrupt = sanitizeInterrupt(body.interrupt);
+    const session = sessionId(req);
+    const gen = Number.isFinite(body.gen) ? body.gen : 0;
+    if (body.mode === 'demo') return send(res, 200, { episode: demoEpisode({ ctx, interrupt }), demo: true, gen, calls: 0 });
 
     if (!AI_ENABLED) throw new AIError('disabled', 'AI 会話は現在停止しています。', { status: 503 });
     if (!hasCredentials()) throw new AIError('no_key', 'サーバーに API キーが設定されていません。', { status: 503 });
+    // 同じタブからの生成は 1 件だけ。観察者の割り込みなら、古い生成を中止して新しいものを優先する
+    const previous = inflight.get(session);
+    if (previous) {
+      if (!interrupt) throw new AIError('in_progress', '会話を生成中です。', { status: 409, retryable: true });
+      previous.abort();
+    }
     // Gemini が混雑中なら、呼ばずに待ち時間を返す（上限の回数も消費しない）
     gate.check();
     const ip = clientIp(req);
-    const end = limiter.begin(ip);
+    const end = limiter.begin(ip, { interrupt: !!interrupt });
+    const controller = new AbortController();
+    inflight.set(session, controller);
     try {
-      const turn = await generateTurn({ speaker, log, ctx, reserve: () => limiter.take(ip), allowRegenerate: gate.failures === 0 });
+      const { episode, calls } = await generateEpisode({ ctx, interrupt, reserve: () => limiter.take(ip), signal: controller.signal });
       gate.onSuccess();
-      return send(res, 200, { ...turn, demo: false });
+      return send(res, 200, { episode, demo: false, gen, calls });
     } catch (err) {
+      if (err instanceof SupersededError) throw new AIError('superseded', '新しい会話の生成に切り替えました。', { status: 409 });
       if (isUpstreamTransient(err)) {
         const wait = gate.onFailure(err.upstream?.httpStatus ? `HTTP ${err.upstream.httpStatus}${err.upstream.status ? ` ${err.upstream.status}` : ''}` : err.upstream?.status || err.code, err.retryAfterMs);
         err.retryAfterMs = Math.max(err.retryAfterMs || 0, wait);
@@ -154,6 +173,7 @@ async function handleApi(req, res, url) {
       throw err;
     } finally {
       end();
+      if (inflight.get(session) === controller) inflight.delete(session);
     }
   }
 

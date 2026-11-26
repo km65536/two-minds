@@ -1,17 +1,18 @@
 // TWO MINDS — クライアント
-// 二人の会話を進め、吹き出しと表情を描く。
-// 文脈（直近の発言・話題の流れ・各自のメモ）は、このタブのセッション中だけ sessionStorage に置く。
-// 長期記憶や会話履歴としては保存しない。「新しい会話」を始めると消える。
+// Gemini が生成した「会話記録（エピソード）」を受け取り、一発言ずつ再生する。
+// 通信するのは、記録を再生し終えて次の記録が必要になったときと、観察者が話しかけたときだけ。
+// 文脈（会話の概要・問題の状態・後回しの疑問・各自のメモ・直近の発言・再生中の記録）は、
+// このタブのセッション中だけ sessionStorage に置く。長期記憶や会話履歴としては保存しない。
 
-const SESSION_KEY = 'twominds:session:v2';
-const RECENT = 16; // サーバーに送る直近の発言数
-const TOPICS = 10;
-const NOTES = 6;
-const IDLE_TURNS = 40; // 操作が無いままこの発言数に達したら一時停止（見ていない間の使いすぎ防止）
+const SESSION_KEY = 'twominds:session:v3';
+const PACE_KEY = 'twominds:pace';
+const RECENT = 12; // 次の記録に引き継ぐ直近の発言数
+const IDLE_EPISODES = 8; // 操作が無いままこの数の会話を再生したら一時停止（見ていない間の使いすぎ防止）
 const MIN_REQUEST_GAP = 2700; // サーバーの最小間隔（2.5 秒）より少し長く
 const PLAYER_COOLDOWN_MS = 3000;
 const PER_CHAR_MS = 45;
 const NAMES = { A: 'レオ', B: 'ミナ' };
+const PHASE_ORDER = ['FREE', 'DISCOVERY', 'EXPLORATION', 'RESOLUTION', 'AFTERMATH'];
 
 const $ = (id) => document.getElementById(id);
 const el = {
@@ -34,27 +35,72 @@ const el = {
 // ---------------- 状態 ----------------
 
 function freshSession() {
-  return { recent: [], topics: [], notes: { A: [], B: [] }, nextSpeaker: Math.random() < 0.5 ? 'A' : 'B', sinceSilence: 0, started: false, mode: null };
+  return {
+    // 次の記録を作るための文脈
+    history: [], // 直近の会話の概要（最大 3）
+    problem: null, // 続いている問題
+    backlog: [], // 後回しにした疑問
+    topics: [],
+    notes: { A: [], B: [] }, // 各自のメモ（本人の分だけが本人の考えになる）
+    recent: [], // 直近に再生した発言
+    // 再生中の記録
+    episode: null, // 記録の情報（発言以外）
+    queue: [], // まだ再生していない発言
+    played: [], // この記録で再生済みの発言
+    started: false,
+    episodesSinceInput: 0,
+    mode: null,
+  };
 }
+
 let S = freshSession();
 let mode = 'ai'; // 'ai' | 'demo'
 let running = false;
-let busy = false;
-let timer = null;
-let quietTimer = null;
-let quiet = false;
+let gen = 0; // 割り込み・新しい会話のたびに増やす。古い処理の結果は使わない
+let loopGen = null; // 再生ループが動いている世代
+let pendingInterrupt = null; // 観察者の発言（次の生成で最優先に送る）
+let currentFetch = null; // { controller, gen }
 let errors = 0;
-let idleTurns = 0;
 let lastPlayerAt = 0;
 let lastRequestAt = 0;
 let pausedByHidden = false;
-let forcedNext = null; // プレイヤーに話しかけられたときの、次の話し手
 let overlayAction = null;
 let serverStatus = { ai: false, reason: 'unknown' };
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const other = (w) => (w === 'A' ? 'B' : 'A');
 const rand = (a, b) => a + Math.random() * (b - a);
+const sessionTag = (() => {
+  try {
+    let t = sessionStorage.getItem('twominds:tab');
+    if (!t) {
+      t = crypto.randomUUID();
+      sessionStorage.setItem('twominds:tab', t);
+    }
+    return t;
+  } catch {
+    return Math.random().toString(36).slice(2, 14) + Date.now().toString(36);
+  }
+})();
+
+// 世代が変わったら途中で抜けられる待ち時間
+const waiters = new Set();
+function sleep(ms, g = gen) {
+  return new Promise((resolve) => {
+    if (g !== gen) return resolve(false);
+    const w = { resolve, t: setTimeout(() => done(true), ms) };
+    function done(v) {
+      clearTimeout(w.t);
+      waiters.delete(w);
+      resolve(v);
+    }
+    w.cancel = () => done(false);
+    waiters.add(w);
+  });
+}
+function bumpGeneration() {
+  gen++;
+  for (const w of [...waiters]) w.cancel();
+}
 
 function saveSession() {
   try {
@@ -66,7 +112,7 @@ function saveSession() {
 function loadSession() {
   try {
     const s = JSON.parse(sessionStorage.getItem(SESSION_KEY) || 'null');
-    if (!s || !Array.isArray(s.recent) || !s.started) return null;
+    if (!s || !s.started || !Array.isArray(s.queue)) return null;
     return { ...freshSession(), ...s, notes: { A: s.notes?.A || [], B: s.notes?.B || [] } };
   } catch {
     return null;
@@ -81,7 +127,7 @@ function clearSession() {
 // ---------------- 表示 ----------------
 
 function setStatus(state) {
-  const labels = { idle: '待機中', running: '会話中', quiet: '静かな間', waiting: '応答待ち', paused: '一時停止中', error: '停止中' };
+  const labels = { idle: '待機中', running: '会話中', thinking: '考え中', quiet: '静かな間', waiting: '応答待ち', paused: '一時停止中', error: '停止中' };
   el.status.dataset.state = state;
   el.statusText.textContent = labels[state];
   el.playBtn.classList.toggle('paused', !running);
@@ -105,8 +151,7 @@ function markAges() {
 /** 吹き出しが表示領域からはみ出さないようにする（古いものから消し、それでも入らなければ文字を詰める） */
 function fitBubbles(current) {
   const box = el.bubbles;
-  // 下揃えなので、はみ出すと先頭の要素が上の余白より上にずれる。
-  // offsetTop はアニメーションの transform の影響を受けないので、登場アニメ中でも誤判定しない
+  // 下揃えなので、はみ出すと先頭の要素が上の余白より上にずれる（offsetTop は登場アニメの影響を受けない）
   const over = () => {
     const first = box.firstElementChild;
     return !!first && first.offsetTop < 4;
@@ -145,6 +190,7 @@ function notice(text, kind = '') {
   n.className = `notice ${kind}`;
   n.textContent = text;
   addBubble(n);
+  return n;
 }
 
 let thinkingNode = null;
@@ -154,7 +200,6 @@ function showThinking(who) {
   thinkingNode.classList.add('thinking');
   thinkingNode.innerHTML = '<span></span><span></span><span></span>';
   addBubble(thinkingNode);
-  setExpression(who, 'thinking');
 }
 function hideThinking() {
   if (thinkingNode) thinkingNode.remove();
@@ -182,29 +227,43 @@ function setExpression(who, expr) {
   c.dataset.shape = restShape(expr);
 }
 
-function nod(who) {
+const ACTION_MS = { nod: 800, tilt: 1600, lean: 1800, laugh: 1000, shrug: 900, look_away: 2200, sip: 1800, think: 2000 };
+function act(who, action) {
+  if (!action || action === 'none' || !ACTION_MS[action]) return;
   const c = el.chars[who];
-  c.classList.remove('nod');
+  const cls = `act-${action}`;
+  c.classList.remove(cls);
   void c.getBoundingClientRect();
-  c.classList.add('nod');
-  setTimeout(() => c.classList.remove('nod'), 800);
+  c.classList.add(cls);
+  setTimeout(() => c.classList.remove(cls), ACTION_MS[action]);
 }
 
-/** 聞いている側の反応（相手のセリフの雰囲気に合わせて、控えめに） */
-function listenerReaction(listener, res) {
+/** 聞いている側の反応（相手の発言の種類に合わせて、控えめに） */
+function listenerReaction(listener, line) {
   const r = Math.random();
-  let expr = null;
-  if (res.intent === 'joke' || res.intent === 'tease' || res.expression === 'laugh') expr = r < 0.65 ? 'smile' : null;
-  else if (res.expression === 'smile') expr = r < 0.4 ? 'smile' : null;
-  else if (res.intent === 'disagree') expr = r < 0.5 ? 'thinking' : r < 0.7 ? 'annoyed' : null;
-  else if (res.intent === 'question') expr = r < 0.5 ? 'thinking' : null;
-  else if (res.expression === 'surprised') expr = r < 0.5 ? 'surprised' : null;
-  else if (res.expression === 'sad' || res.expression === 'troubled') expr = r < 0.4 ? 'troubled' : null;
+  const map = {
+    joke: r < 0.7 ? 'smile' : 'laugh',
+    hypothesis: r < 0.6 ? 'thinking' : 'surprised',
+    objection: r < 0.5 ? 'thinking' : r < 0.75 ? 'troubled' : 'annoyed',
+    insight: r < 0.6 ? 'surprised' : 'thinking',
+    question: 'thinking',
+    concede: 'smile',
+    conclusion: r < 0.6 ? 'smile' : 'neutral',
+    agree: 'smile',
+  };
+  let expr = map[line.type] || null;
+  if (!expr && (line.expression === 'laugh' || line.expression === 'smile')) expr = r < 0.5 ? 'smile' : null;
+  if (!expr && line.expression === 'sad') expr = r < 0.5 ? 'troubled' : null;
   setExpression(listener, expr || 'neutral');
+  if (['hypothesis', 'insight', 'conclusion', 'agree'].includes(line.type) && r < 0.5) setTimeout(() => act(listener, 'nod'), 700);
 }
 
-// 発言に合わせて口を動かしながら、1 文字ずつ表示する
-async function speak(who, text, expr) {
+// いま話している発言と、そこまでに表示した文字（割り込まれたとき、途中までを文脈に残すため）
+let speakingNow = null;
+
+// 口を動かしながら 1 文字ずつ表示する。割り込まれたら途中で止める（false を返す）
+async function speak(who, text, expr, g, line = null) {
+  speakingNow = line ? { line, shown: '' } : null;
   const c = el.chars[who];
   const bubble = speechBubble(who);
   addBubble(bubble);
@@ -214,18 +273,27 @@ async function speak(who, text, expr) {
   const fast = document.hidden || matchMedia('(prefers-reduced-motion: reduce)').matches;
   let i = 0;
   for (const ch of Array.from(text)) {
+    if (g !== gen) {
+      bubble.textContent += '…';
+      bubble.classList.add('cut');
+      c.dataset.shape = rest;
+      return false;
+    }
     bubble.textContent += ch;
+    if (speakingNow) speakingNow.shown += ch;
     if (i % 4 === 0) fitBubbles(bubble);
     if (!fast) {
-      const pause = '、。！？!?…'.includes(ch);
-      c.dataset.shape = pause ? rest : i % 3 === 0 ? 'open' : i % 3 === 1 ? 'mid' : rest;
-      await sleep(pause ? PER_CHAR_MS * 5 : PER_CHAR_MS);
+      const p = '、。！？!?…'.includes(ch);
+      c.dataset.shape = p ? rest : i % 3 === 0 ? 'open' : i % 3 === 1 ? 'mid' : rest;
+      await sleep(p ? PER_CHAR_MS * 5 : PER_CHAR_MS, g);
     }
     i++;
   }
   bubble.textContent = text;
   fitBubbles(bubble);
   c.dataset.shape = rest; // 言い終わったら口を閉じる
+  speakingNow = null;
+  return true;
 }
 
 function blinkLoop(who) {
@@ -264,15 +332,17 @@ class ApiError extends Error {
   }
 }
 
-async function api(path, body) {
+async function api(path, body, signal) {
   let res;
   try {
     res = await fetch(path, {
       method: body ? 'POST' : 'GET',
-      headers: body ? { 'Content-Type': 'application/json', 'X-Two-Minds': '1' } : {},
+      headers: body ? { 'Content-Type': 'application/json', 'X-Two-Minds': '1', 'X-Two-Minds-Session': sessionTag } : {},
       body: body ? JSON.stringify(body) : undefined,
+      signal,
     });
-  } catch {
+  } catch (e) {
+    if (e?.name === 'AbortError') throw new ApiError('aborted', 'aborted', false, { source: 'client' });
     throw new ApiError('offline', 'サーバーに接続できません（ネットワークを確認してください）。', true, { source: 'network' });
   }
   let data = null;
@@ -282,7 +352,6 @@ async function api(path, body) {
   if (!res.ok) {
     const e = data?.error;
     if (e?.code) {
-      // このアプリのサーバーが返したエラー（Gemini 由来なら source が 'gemini'）
       throw new ApiError(e.code, e.message, !!e.retryable, { source: e.source || 'server', retryAfterMs: e.retryAfterMs || 0, httpStatus: res.status });
     }
     // JSON でない応答 = アプリより手前（Render のプロキシなど）が返したもの。起動中・再起動中に起きる
@@ -292,6 +361,30 @@ async function api(path, body) {
   return data;
 }
 
+// ---------------- 通信の間隔（サーバーの上限にぶつからないよう、クライアント自身が間をあける） ----------------
+
+let requestTimes = [];
+try {
+  requestTimes = (JSON.parse(sessionStorage.getItem(PACE_KEY) || '[]') || []).filter((t) => Date.now() - t < 60_000);
+  lastRequestAt = requestTimes.at(-1) || 0;
+} catch {}
+function notePace() {
+  requestTimes.push(Date.now());
+  try {
+    sessionStorage.setItem(PACE_KEY, JSON.stringify(requestTimes.slice(-30)));
+  } catch {}
+}
+function paceWait({ interrupt = false } = {}) {
+  if (mode === 'demo') return 0;
+  const now = Date.now();
+  while (requestTimes.length && now - requestTimes[0] >= 60_000) requestTimes.shift();
+  const perMinute = Math.max(1, (serverStatus.pace?.perMinute || 8) - 1);
+  const budget = requestTimes.length >= perMinute ? requestTimes[0] + 60_000 - now + 200 : 0;
+  if (interrupt) return Math.max(0, budget); // 観察者の発言は最優先（回数の上限だけ守る）
+  const gap = Math.max(MIN_REQUEST_GAP, (serverStatus.pace?.minIntervalMs || 2500) + 200) - (now - lastRequestAt);
+  return Math.max(0, gap, budget);
+}
+
 // ---------------- 会話の文脈（セッション中のみ） ----------------
 
 function remember(entry) {
@@ -299,188 +392,190 @@ function remember(entry) {
   if (S.recent.length > RECENT) S.recent = S.recent.slice(-RECENT);
 }
 
-function rememberTurn(speaker, res) {
-  if (res.topic) {
-    const last = S.topics.at(-1);
-    if (!last || last.label !== res.topic) S.topics.push({ label: res.topic, genre: res.genre });
-    if (S.topics.length > TOPICS) S.topics = S.topics.slice(-TOPICS);
+function contextPayload() {
+  return { history: S.history, problem: S.problem, backlog: S.backlog, topics: S.topics, notes: S.notes, recent: S.recent };
+}
+
+/** 再生中の記録のうち、ここまでに話された範囲での問題の状態（まだ言っていない結論は含めない） */
+function problemSnapshot() {
+  const ep = S.episode;
+  if (!ep?.problem?.exists) return S.problem;
+  const reached = S.played.reduce((m, l) => Math.max(m, PHASE_ORDER.indexOf(l.phase)), 0);
+  if (reached < PHASE_ORDER.indexOf('DISCOVERY')) return S.problem; // まだ問題が出ていない
+  const p = ep.problem;
+  return {
+    question: p.question,
+    kind: p.kind,
+    status: 'exploring',
+    leo_view: reached >= 2 ? p.leo_view : '',
+    mina_view: reached >= 2 ? p.mina_view : '',
+    explored: reached >= 2 ? p.explored : [],
+    conclusion: reached >= 3 ? p.conclusion : '',
+    open_points: reached >= 3 ? p.open_points : [],
+    phase: PHASE_ORDER[reached],
+  };
+}
+
+/** 記録を最後まで再生したら、その内容を次の記録のための文脈にまとめる */
+function finishEpisode() {
+  const ep = S.episode;
+  if (!ep) return;
+  const p = ep.problem || {};
+  S.history.push({ summary: ep.summary, question: p.exists ? p.question : '', status: p.status || 'none', conclusion: p.conclusion || '' });
+  if (S.history.length > 3) S.history = S.history.slice(-3);
+  if (ep.topic && S.topics.at(-1) !== ep.topic) S.topics.push(ep.topic);
+  if (S.topics.length > 10) S.topics = S.topics.slice(-10);
+  for (const w of ['A', 'B']) {
+    const n = ep.notes?.[w];
+    if (n && !S.notes[w].includes(n)) S.notes[w].push(n);
+    if (S.notes[w].length > 6) S.notes[w] = S.notes[w].slice(-6);
   }
-  if (res.note) {
-    const list = S.notes[speaker];
-    if (!list.includes(res.note)) list.push(res.note);
-    if (list.length > NOTES) S.notes[speaker] = list.slice(-NOTES);
-  }
+  // 扱った疑問は後回しリストから消し、新しく後回しにした疑問を足す
+  if (p.exists) S.backlog = S.backlog.filter((q) => q !== p.question);
+  for (const q of ep.next?.deferred_questions || []) if (!S.backlog.includes(q)) S.backlog.push(q);
+  if (S.backlog.length > 5) S.backlog = S.backlog.slice(-5);
+  S.problem = p.exists && (p.status === 'continuing' || p.status === 'exploring') ? { ...p, phase: 'EXPLORATION' } : null;
+  S.episode = null;
+  S.played = [];
+  S.episodesSinceInput++;
 }
 
-// ---------------- 会話の進行 ----------------
+// ---------------- 会話の再生 ----------------
 
-function waitVisible() {
-  if (!document.hidden) return Promise.resolve();
-  return new Promise((r) => {
-    const h = () => {
-      if (!document.hidden) {
-        document.removeEventListener('visibilitychange', h);
-        r();
-      }
-    };
-    document.addEventListener('visibilitychange', h);
-  });
-}
-
-// 直近 1 分の AI リクエスト時刻。サーバーの上限にぶつからないよう、クライアント自身が間をあける。
-// 再読み込みしても間隔が崩れないよう、時刻だけは sessionStorage に置く（会話内容ではない）。
-const PACE_KEY = 'twominds:pace';
-let requestTimes = [];
-try {
-  requestTimes = (JSON.parse(sessionStorage.getItem(PACE_KEY) || '[]') || []).filter((t) => Date.now() - t < 60_000);
-  lastRequestAt = requestTimes.at(-1) || 0;
-} catch {}
-function notePace(n = 1) {
-  for (let k = 0; k < n; k++) requestTimes.push(Date.now());
-  try {
-    sessionStorage.setItem(PACE_KEY, JSON.stringify(requestTimes.slice(-30)));
-  } catch {}
-}
-
-function paceWait() {
-  if (mode === 'demo') return 0;
-  const now = Date.now();
-  while (requestTimes.length && now - requestTimes[0] >= 60_000) requestTimes.shift();
-  const perMinute = Math.max(1, (serverStatus.pace?.perMinute || 8) - 1);
-  // 枠に余裕があるうちはテンポよく、使うほど一定の間隔に落ち着く（使い切って長く止まるのを避ける）
-  const steady = requestTimes.length >= Math.ceil(perMinute / 2) ? 60_000 / perMinute : 0;
-  const gap = Math.max(MIN_REQUEST_GAP, (serverStatus.pace?.minIntervalMs || 2500) + 200, steady) - (now - lastRequestAt);
-  const budget = requestTimes.length >= perMinute ? requestTimes[0] + 60_000 - now + 200 : 0;
-  return Math.max(0, gap, budget);
-}
-
-function schedule(delay) {
-  clearTimeout(timer);
-  timer = setTimeout(() => running && !quiet && step(), Math.max(delay, paceWait()));
-}
-
-function ownRun(speaker) {
-  let n = 0;
-  for (let i = S.recent.length - 1; i >= 0; i--) {
-    if (S.recent[i].kind === 'say' && S.recent[i].speaker === speaker) n++;
-    else break;
-  }
-  return n;
-}
-
-async function step({ once = false } = {}) {
-  if (busy) return;
-  busy = true;
-  clearTimeout(timer);
-  const speaker = S.nextSpeaker;
-  showThinking(speaker);
-  lastRequestAt = Date.now();
-  if (mode !== 'demo') notePace();
-  let res = null;
-  try {
-    res = await api('/api/turn', { mode, speaker, log: S.recent, context: { topics: S.topics, notes: S.notes } });
-    if ((res.calls || 1) > 1) notePace(res.calls - 1); // 作り直しの分も数える
-    await waitVisible(); // 画面を離れている間に届いた発言は、戻ってから話す
-    hideThinking();
-    if (waitNotice) {
-      clearWaitNotice();
-      if (running) setStatus('running');
-    }
-    for (const e of S.recent) if (e.kind === 'player' && !e.answeredBy.includes(speaker)) e.answeredBy.push(speaker);
-    remember({ kind: 'say', speaker, text: res.text, intent: res.intent, topic: res.topic, answeredBy: [] });
-    rememberTurn(speaker, res);
-    S.sinceSilence++;
-    listenerReaction(other(speaker), res);
-    await speak(speaker, res.text, res.expression);
-    if (Math.random() < 0.45) nod(other(speaker));
-    errors = 0;
-    transientErrors = 0;
-    idleTurns++;
-  } catch (err) {
-    hideThinking();
-    setExpression(speaker, 'neutral');
-    res = null;
-    const delay = handleError(err, speaker);
-    busy = false;
+async function playLine(line, g) {
+  const speaker = line.speaker;
+  const listener = other(speaker);
+  // 発言の前の間
+  if (line.pause === 'long') {
+    // 意図的な沈黙・考え込む時間（API の待ち時間とは別。吹き出しは出さない）
+    setStatus('quiet');
     setRoles(null);
-    saveSession();
-    if (running && !once && delay !== null) schedule(delay);
-    return;
-  }
-  busy = false;
-  setRoles(null);
-  decideNext(speaker, res, once);
-  saveSession();
-}
-
-/** 次に誰が、どのくらいの間をおいて話すかを決める */
-function decideNext(speaker, res, once) {
-  const len = Array.from(res.text).length;
-  const read = { lively: 22, normal: 38, slow: 52 }[res.tempo] ?? 38;
-  const base = { lively: 700, normal: 1500, slow: 2600 }[res.tempo] ?? 1500;
-  let delay = Math.min(7000, base + len * read);
-
-  if (forcedNext) {
-    S.nextSpeaker = forcedNext;
-    forcedNext = null;
-  } else if (res.after === 'continue' && ownRun(speaker) < 2) {
-    S.nextSpeaker = speaker; // 言い足りないので自分が続ける
-    delay = Math.min(delay, 900 + len * 15);
-  } else if (res.after === 'silence' && S.sinceSilence >= 5) {
-    S.nextSpeaker = other(speaker);
-    if (running && !once) beginSilence(delay);
-    return;
-  } else {
-    S.nextSpeaker = other(speaker);
-  }
-
-  if (!running || once) return;
-  if (idleTurns >= IDLE_TURNS) {
-    pause();
-    showOverlay({ title: 'まだ見ていますか？', text: 'しばらく操作がなかったので、会話を一時停止しました。', button: '続きを見る', action: play });
-    return;
-  }
-  schedule(delay);
-}
-
-/** 意図的な沈黙。API の待ち時間とは区別して、吹き出しを出さずに静かな間をとる */
-function beginSilence(afterDelay) {
-  quiet = true;
-  setStatus('quiet');
-  const length = afterDelay + rand(6000, 13000);
-  setTimeout(() => {
-    if (!quiet) return;
     for (const w of ['A', 'B']) {
-      setExpression(w, 'neutral');
+      setExpression(w, w === speaker ? 'thinking' : 'neutral');
       el.chars[w].classList.add('away');
     }
     markAges();
     [...el.bubbles.children].forEach((n) => n.classList.add('older'));
-  }, afterDelay);
-  clearTimeout(quietTimer);
-  quietTimer = setTimeout(() => endSilence(true), length);
+    await sleep(rand(3500, 7000), g);
+    for (const w of ['A', 'B']) el.chars[w].classList.remove('away');
+    if (g !== gen) return false;
+    if (running) setStatus('running');
+  } else if (line.pause === 'short' || ['hypothesis', 'insight', 'objection'].includes(line.type)) {
+    setExpression(speaker, 'thinking');
+    if (line.pause === 'short') act(speaker, 'think');
+    await sleep(line.pause === 'short' ? rand(900, 1600) : rand(300, 600), g);
+    if (g !== gen) return false;
+  }
+  listenerReaction(listener, line);
+  act(speaker, line.action);
+  const done = await speak(speaker, line.text, line.expression, g, line);
+  setRoles(null);
+  return done;
 }
 
-function endSilence(natural) {
-  if (!quiet) return;
-  quiet = false;
-  clearTimeout(quietTimer);
-  for (const w of ['A', 'B']) el.chars[w].classList.remove('away');
-  if (natural) {
-    remember({ kind: 'pause', speaker: null, text: '', intent: '', topic: '', answeredBy: [] });
-    S.sinceSilence = 0;
-    // 沈黙を破るのはどちらでもいい
-    S.nextSpeaker = Math.random() < 0.5 ? 'A' : 'B';
+/** 次の発言までの間（文字数・話者の交代で変える） */
+function gapAfter(line, next) {
+  const len = Array.from(line.text).length;
+  let ms = 900 + Math.min(4200, len * 32);
+  if (next && next.speaker === line.speaker) ms = 500 + Math.min(1500, len * 12);
+  if (line.type === 'joke' || line.expression === 'laugh') ms += 400;
+  return ms;
+}
+
+/** 再生ループ。世代（gen）が変わったら、古いループは静かに抜ける */
+async function loop() {
+  if (loopGen === gen) return;
+  const g = gen;
+  loopGen = g;
+  try {
+    while (running && g === gen) {
+      if (pendingInterrupt || !S.queue.length) {
+        if (!S.queue.length && S.episode) finishEpisode();
+        if (!pendingInterrupt && S.episodesSinceInput >= IDLE_EPISODES) {
+          pause();
+          showOverlay({ title: 'まだ見ていますか？', text: 'しばらく操作がなかったので、会話を一時停止しました。', button: '続きを見る', action: () => { S.episodesSinceInput = 0; play(); } });
+          break;
+        }
+        const ok = await fetchEpisode(g);
+        if (!ok) break;
+        continue;
+      }
+      const line = S.queue[0];
+      const done = await playLine(line, g);
+      if (g !== gen) break; // 割り込まれた（その発言は途中まで）
+      S.queue.shift();
+      if (done) {
+        S.played.push(line);
+        remember({ kind: 'say', speaker: line.speaker, text: line.text });
+      }
+      saveSession();
+      if (!S.queue.length) {
+        // 一つの会話の終わり：少し余韻をおいてから次へ
+        await sleep(gapAfter(line, null) + rand(1200, 2600), g);
+        continue;
+      }
+      await sleep(gapAfter(line, S.queue[0]), g);
+    }
+  } finally {
+    if (loopGen === g) loopGen = null;
   }
-  if (running) {
+}
+
+/** 次の会話記録を 1 回だけ生成する。成功したら true、止めるべきなら false */
+async function fetchEpisode(g) {
+  const interrupt = pendingInterrupt;
+  setStatus('thinking');
+  setRoles(null);
+  for (const w of ['A', 'B']) setExpression(w, interrupt ? 'surprised' : 'thinking');
+  if (interrupt) setTimeout(() => g === gen && ['A', 'B'].forEach((w) => setExpression(w, 'thinking')), 900);
+  // 待ち時間が長くなったら、どちらかが話し出しそうな「…」を出す
+  const dots = setTimeout(() => g === gen && showThinking(Math.random() < 0.5 ? 'A' : 'B'), interrupt ? 400 : 1500);
+
+  const wait = paceWait({ interrupt: !!interrupt });
+  if (wait > 0 && !(await sleep(wait, g))) {
+    clearTimeout(dots);
+    return false;
+  }
+  const controller = new AbortController();
+  currentFetch = { controller, gen: g };
+  lastRequestAt = Date.now();
+  if (mode !== 'demo') notePace();
+  try {
+    const res = await api('/api/episode', { mode, gen: g, context: contextPayload(), interrupt }, controller.signal);
+    clearTimeout(dots);
+    if (g !== gen) return false; // 割り込みで古くなった結果は使わない
+    hideThinking();
+    if (interrupt && pendingInterrupt === interrupt) pendingInterrupt = null;
+    if (res.episode?.lines?.length) {
+      const { lines, ...meta } = res.episode;
+      S.episode = meta;
+      S.queue = lines;
+      S.played = [];
+    }
+    errors = 0;
+    transientErrors = 0;
+    if (waitNotice) clearWaitNotice();
     setStatus('running');
-    if (natural) schedule(0);
+    saveSession();
+    return true;
+  } catch (err) {
+    clearTimeout(dots);
+    if (g !== gen || err.code === 'aborted' || err.code === 'superseded') return false;
+    hideThinking();
+    for (const w of ['A', 'B']) setExpression(w, 'neutral');
+    const delay = handleError(err);
+    saveSession();
+    if (delay === null) return false;
+    return await sleep(delay, g);
+  } finally {
+    if (currentFetch?.controller === controller) currentFetch = null;
   }
 }
 
-/** エラーを処理し、次の発言までの待ち時間を返す（続けない場合は null） */
+// ---------------- エラー ----------------
+
 // 一時的な障害（Gemini の過負荷・分間上限・タイムアウト、通信、サーバーの起動中）
-const TRANSIENT = ['upstream_unavailable', 'upstream_cooldown', 'upstream_busy', 'timeout', 'network', 'host_unavailable', 'offline'];
+const TRANSIENT = ['upstream_unavailable', 'upstream_cooldown', 'upstream_busy', 'timeout', 'network', 'host_unavailable', 'offline', 'in_progress'];
 const TRANSIENT_MAX = 5; // 続けて失敗したら止める回数（無限にはやり直さない）
 const TRANSIENT_BACKOFF = [6000, 15000, 30000, 45000];
 let transientErrors = 0;
@@ -501,7 +596,8 @@ function clearWaitNotice() {
   markAges();
 }
 
-function handleError(err, speaker) {
+/** エラーを処理し、もう一度生成するまでの待ち時間を返す（続けない場合は null） */
+function handleError(err) {
   const code = err?.code;
   if (TRANSIENT.includes(code)) {
     transientErrors++;
@@ -524,18 +620,14 @@ function handleError(err, speaker) {
     errors = 0;
     return 1500;
   }
-  if (code === 'blocked') {
-    notice(err.message);
-    S.nextSpeaker = other(speaker);
-    return errors >= 3 ? stopWithError(err) : 2500;
+  if (code === 'blocked' || code === 'bad_output' || code === 'max_tokens') {
+    // 生成し直す（別の内容になる）。続くようなら止める
+    if (errors >= 3) return stopWithError(err);
+    notice(`${err.message}`, 'error');
+    return 4000;
   }
   if (code === 'too_fast' || code === 'busy') {
-    // このサーバーの上限による待ち（AI は呼んでいない）：少し待ってやり直す（上限 3 回）
     return errors >= 4 ? stopWithError(err) : Math.max(err.retryAfterMs || 0, [3000, 6000, 10000][errors - 1] || 10000);
-  }
-  if (err?.retryable && errors < 3) {
-    notice('通信がうまくいかなかったので、少し待ってやり直します…', 'error');
-    return [3000, 6000, 12000][errors - 1];
   }
   return stopWithError(err);
 }
@@ -547,31 +639,31 @@ function stopWithError(err) {
   return null;
 }
 
+// ---------------- 操作 ----------------
+
 function play() {
   if (running) return;
   el.overlay.hidden = true;
   running = true;
   errors = 0;
   transientErrors = 0;
-  idleTurns = 0;
   if (!S.started) {
     S.started = true;
-    if (mode === 'demo') notice('デモモード — この会話は AI ではなく、決まった文型で作られています', 'demo');
+    if (mode === 'demo') notice('デモモード — この会話は AI ではなく、用意した台本です', 'demo');
   }
-  setStatus('running');
+  setStatus(S.queue.length ? 'running' : 'thinking');
   saveSession();
-  if (!busy) schedule(0);
+  loop();
 }
 
 function pause() {
   if (!running) return;
   running = false;
-  clearTimeout(timer);
-  endSilence(false);
   setStatus('paused');
   saveSession();
 }
 
+/** 観察者の発言：再生中の会話を止め、残りの記録を捨てて、発言を踏まえた新しい記録を作る */
 function sendPlayer() {
   const text = el.input.value.replace(/\s+/g, ' ').trim().slice(0, 100);
   if (!text) return;
@@ -582,41 +674,55 @@ function sendPlayer() {
   }
   lastPlayerAt = now;
   el.input.value = '';
-  idleTurns = 0;
-  remember({ kind: 'player', speaker: null, text, intent: '', topic: '', answeredBy: [] });
-  addBubble(playerBubble(text));
 
-  // 名前を呼ばれた方が先に反応する。呼ばれていなければ、どちらでも
-  const responder = /レオ/.test(text) && !/ミナ/.test(text) ? 'A' : /ミナ/.test(text) && !/レオ/.test(text) ? 'B' : Math.random() < 0.5 ? 'A' : 'B';
+  // その時点までの要点・問題・二人の考えを残す
+  // 話している途中で割り込んだら、そこまで聞こえた分を「…」付きで残す
+  if (speakingNow && speakingNow.shown.length >= 4) {
+    const cut = { ...speakingNow.line, text: `${speakingNow.shown}…` };
+    S.played.push(cut);
+    remember({ kind: 'say', speaker: cut.speaker, text: cut.text });
+  }
+  speakingNow = null;
+  // 生成を待っている間に続けて話しかけられたら、二つの発言をまとめて一度に送る（生成は 1 件だけ）
+  pendingInterrupt = pendingInterrupt
+    ? { ...pendingInterrupt, text: `${pendingInterrupt.text} / ${text}`.slice(-100) }
+    : { text, played: S.played.slice(-40), problem: problemSnapshot() };
+  const snapshot = pendingInterrupt.problem;
+  // 再生中の会話を止めて、まだ再生していない記録は捨てる
+  bumpGeneration();
+  if (currentFetch) currentFetch.controller.abort();
+  S.queue = [];
+  S.problem = snapshot;
+  S.episode = null;
+  S.played = [];
+  S.episodesSinceInput = 0;
+  remember({ kind: 'player', speaker: null, text });
+  hideThinking();
+  addBubble(playerBubble(text));
+  setRoles(null);
+  for (const w of ['A', 'B']) setExpression(w, 'surprised');
   saveSession();
 
-  if (!S.started) {
-    S.nextSpeaker = responder;
-    play();
-    return;
-  }
   el.overlay.hidden = true;
-  if (busy) {
-    forcedNext = responder; // 今の発言が終わったら
-    return;
-  }
-  S.nextSpeaker = responder;
-  if (quiet) endSilence(false);
-  if (running) schedule(700);
-  else {
-    // 一時停止中でも、話しかけたら一人が応える
-    clearTimeout(timer);
-    timer = setTimeout(() => !running && !busy && step({ once: true }), paceWait());
+  if (!running) {
+    play(); // 話しかけたら会話が動き出す
+  } else {
+    loopGen = null;
+    loop();
   }
 }
 
 function newConversation() {
+  bumpGeneration();
+  if (currentFetch) currentFetch.controller.abort();
   clearSession();
   S = freshSession();
-  forcedNext = null;
+  pendingInterrupt = null;
   el.bubbles.innerHTML = '';
   for (const w of ['A', 'B']) setExpression(w, 'neutral');
   if (serverStatus.ai) setMode('ai');
+  running = false;
+  loopGen = null;
   play();
 }
 
@@ -647,7 +753,7 @@ function bind() {
     sendPlayer();
   });
 
-  // 画面を離れたら、すぐに会話の生成を止める。戻ったら続きから再開する
+  // 画面を離れたら止める（再生も次の生成も）。戻ったら続きから再開する
   document.addEventListener('visibilitychange', () => {
     if (document.hidden) {
       if (running) {
@@ -671,9 +777,8 @@ function bind() {
 }
 
 function restoreBubbles() {
-  // 再開時は、直前の二つのセリフだけを薄く出しておく
-  const lastLines = S.recent.filter((e) => e.kind === 'say' || e.kind === 'player').slice(-2);
-  for (const e of lastLines) addBubble(e.kind === 'player' ? playerBubble(e.text) : Object.assign(speechBubble(e.speaker), { textContent: e.text }));
+  // 再開時は、直前の二つの発言だけを薄く出しておく
+  for (const e of S.recent.slice(-2)) addBubble(e.kind === 'player' ? playerBubble(e.text) : Object.assign(speechBubble(e.speaker), { textContent: e.text }));
 }
 
 async function init() {
@@ -697,21 +802,14 @@ async function init() {
         disabled: 'AI 会話は現在停止しています。',
         daily_limit: '今日の AI 会話の上限に達しました。',
         offline: 'サーバーに接続できませんでした。',
-      }[serverStatus.reason] || 'いまは AI を利用できません。') + 'デモモード（AI ではない、決まった文型の会話）で動きます。';
+      }[serverStatus.reason] || 'いまは AI を利用できません。') + 'デモモード（AI ではない、用意した台本の会話）で動きます。';
 
   const saved = loadSession();
   if (saved) {
     S = saved;
     if (saved.mode === 'demo') setMode('demo');
     restoreBubbles();
-    showOverlay({
-      title: '続きから見ますか？',
-      text: '二人は、さっきの話の途中です。',
-      note: why,
-      button: '続きを見る',
-      alt: '新しい会話をはじめる',
-      action: play,
-    });
+    showOverlay({ title: '続きから見ますか？', text: '二人は、さっきの話の途中です。', note: why, button: '続きを見る', alt: '新しい会話をはじめる', action: play });
     return;
   }
   showOverlay({

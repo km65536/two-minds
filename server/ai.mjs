@@ -1,6 +1,6 @@
 // Gemini API 呼び出し。API キーはサーバー側の環境変数からのみ読み込む。
 import { GoogleGenAI, ApiError } from '@google/genai';
-import { buildTurnPrompt, TURN_SCHEMA, normalizeTurn, findDuplicate } from './conversation.mjs';
+import { buildEpisodePrompt, EPISODE_SCHEMA, normalizeEpisode, salvageEpisode } from './conversation.mjs';
 
 export class AIError extends Error {
   /**
@@ -56,8 +56,8 @@ export function logUpstream(kind, fields) {
 export function getConfig() {
   return {
     model: process.env.GEMINI_MODEL?.trim() || 'gemini-3.5-flash-lite',
-    // 出力トークンの上限（思考トークンも出力に含まれるため、短い発言でも余裕を持たせる）
-    maxOutputTokens: Number(process.env.GEMINI_MAX_OUTPUT_TOKENS) || 2048,
+    // 出力トークンの上限。一連の会話記録（最大 36 発言）をまとめて書くので、思考トークンも含めて余裕を持たせる
+    maxOutputTokens: Number(process.env.GEMINI_MAX_OUTPUT_TOKENS) || 8192,
     // 思考の深さ（例: low）。未設定なら送らず、モデルの既定値を使う
     thinkingLevel: (process.env.GEMINI_THINKING_LEVEL || '').trim().toUpperCase(), // MINIMAL / LOW / MEDIUM / HIGH
   };
@@ -77,14 +77,20 @@ function getClient() {
       apiKey: apiKey(),
       // 無料枠を浪費しないよう、SDK 側の自動リトライは行わない
       // 1 回の呼び出しの制限時間。混雑時は応答が遅くなるので、短すぎない値にしている
-      httpOptions: { timeout: Number(process.env.GEMINI_TIMEOUT_MS) || 30_000, retryOptions: { attempts: 1 } },
+      httpOptions: { timeout: Number(process.env.GEMINI_TIMEOUT_MS) || 60_000, retryOptions: { attempts: 1 } },
     });
   }
   return client;
 }
 
-/** 1 回だけ呼び出し、JSON をパースして返す */
-async function callJSON({ system, user }) {
+/** 生成を中止したとき（観察者の割り込みで、古いリクエストを取り消した） */
+export class SupersededError extends Error {}
+
+/**
+ * 1 回だけ呼び出し、会話記録の JSON を返す。
+ * 出力が上限で途中で切れた（MAX_TOKENS）ときは、完全な発言だけを取り出して返す（追加の呼び出しはしない）。
+ */
+async function callEpisode({ system, user }, signal) {
   const cfg = getConfig();
   const started = Date.now();
   let res;
@@ -95,13 +101,18 @@ async function callJSON({ system, user }) {
       config: {
         systemInstruction: system,
         responseMimeType: 'application/json',
-        responseJsonSchema: TURN_SCHEMA,
+        responseJsonSchema: EPISODE_SCHEMA,
         maxOutputTokens: cfg.maxOutputTokens,
         temperature: 1.0,
         ...(cfg.thinkingLevel ? { thinkingConfig: { thinkingLevel: cfg.thinkingLevel } } : {}),
+        ...(signal ? { abortSignal: signal } : {}),
       },
     });
   } catch (err) {
+    if (signal?.aborted) {
+      logUpstream('aborted', { model: cfg.model, ms: Date.now() - started, reason: 'superseded by a newer request' });
+      throw new SupersededError('superseded');
+    }
     const e = toAIError(err);
     logUpstream('error', {
       model: cfg.model,
@@ -115,21 +126,33 @@ async function callJSON({ system, user }) {
     });
     throw e;
   }
+  if (signal?.aborted) throw new SupersededError('superseded');
 
   if (res.promptFeedback?.blockReason) {
     logUpstream('blocked', { model: cfg.model, ms: Date.now() - started, blockReason: res.promptFeedback.blockReason });
-    throw new AIError('blocked', 'この流れの発言は生成できませんでした。話題を変えて続けます。', { status: 422, retryable: true });
+    throw new AIError('blocked', 'この流れの会話は生成できませんでした。別の話にして続けます。', { status: 422, retryable: true, source: 'gemini' });
   }
   const finish = res.candidates?.[0]?.finishReason;
-  if (finish && !['STOP', 'FINISH_REASON_UNSPECIFIED'].includes(finish)) {
-    logUpstream('finish', { model: cfg.model, ms: Date.now() - started, finishReason: finish });
-    const code = finish === 'MAX_TOKENS' ? 'max_tokens' : 'blocked';
-    throw new AIError(code, code === 'blocked' ? 'この流れの発言は生成できませんでした。話題を変えて続けます。' : '発言が途中で切れました。', { status: code === 'blocked' ? 422 : 502, retryable: true });
+  const text = res.text || '';
+  const ms = Date.now() - started;
+  if (finish && !['STOP', 'FINISH_REASON_UNSPECIFIED', 'MAX_TOKENS'].includes(finish)) {
+    logUpstream('finish', { model: cfg.model, ms, finishReason: finish });
+    throw new AIError('blocked', 'この流れの会話は生成できませんでした。別の話にして続けます。', { status: 422, retryable: true, source: 'gemini' });
+  }
+  if (finish === 'MAX_TOKENS') {
+    const partial = salvageEpisode(text);
+    logUpstream('finish', { model: cfg.model, ms, finishReason: finish, salvagedLines: partial?.lines?.length ?? 0 });
+    if (partial?.lines?.length) return { data: partial, truncated: true, ms };
+    throw new AIError('max_tokens', '会話の記録が途中で切れてしまいました。', { status: 502, retryable: true, source: 'gemini' });
   }
   try {
-    return JSON.parse(res.text || '');
+    return { data: JSON.parse(text), truncated: false, ms };
   } catch {
-    throw new AIError('bad_output', 'AI の応答を読み取れませんでした。', { status: 502, retryable: true });
+    // 形式が崩れていても、読める発言があれば使う
+    const partial = salvageEpisode(text);
+    logUpstream('bad_json', { model: cfg.model, ms, length: text.length, salvagedLines: partial?.lines?.length ?? 0 });
+    if (partial?.lines?.length) return { data: partial, truncated: true, ms };
+    throw new AIError('bad_output', 'AI の応答を読み取れませんでした。', { status: 502, retryable: true, source: 'gemini' });
   }
 }
 
@@ -165,40 +188,18 @@ export function toAIError(err) {
 }
 
 /**
- * 1 発言を生成する。reserve() は API を 1 回呼ぶ直前に呼ばれ、上限を超えていれば例外を投げる。
- * 重複時の作り直しも上限に数えるため、呼び出し回数は必ず reserve を通る。
+ * 一連の会話記録（エピソード）を 1 回の呼び出しで生成する。
+ * reserve() は API を呼ぶ直前に呼ばれ、上限を超えていれば例外を投げる。作り直しの呼び出しはしない。
  */
-export async function generateTurn({ speaker, log, ctx, reserve = () => {}, allowRegenerate = true }) {
-  const started = Date.now();
-  const prompt = buildTurnPrompt({ speaker, log, ctx });
-  let calls = 0;
-  const take = () => {
-    reserve();
-    calls++;
-  };
-  take();
-  let turn = normalizeTurn(await callJSON(prompt), prompt.analysis);
-
-  // 作り直しは、最初の呼び出しが速く済み、Gemini が安定しているときだけ（失敗が続く時間帯に呼び出しを増やさない）
-  const canRegenerate = allowRegenerate && Date.now() - started < 12_000;
-  if (!turn.text || (canRegenerate && findDuplicate(turn.text, log))) {
-    if (!turn.text && !canRegenerate) throw new AIError('empty', 'AI が発言を生成できませんでした。', { status: 502, retryable: true, source: 'gemini' });
-    try {
-      take();
-      const retry = normalizeTurn(
-        await callJSON({
-          system: prompt.system,
-          user: `${prompt.user}\n\n# 注意\n次の発言は直前の会話と重複していたので使えません。違う角度・違う言葉で話してください:\n「${turn.text}」`,
-        }),
-        prompt.analysis,
-      );
-      if (retry.text && !findDuplicate(retry.text, log)) turn = retry;
-    } catch (err) {
-      if (!turn.text) throw err;
-      // 作り直せなくても、最初の発言が空でなければそれを使う
-    }
-    if (!turn.text) throw new AIError('empty', 'AI が発言を生成できませんでした。', { status: 502, retryable: true });
+export async function generateEpisode({ ctx, interrupt = null, reserve = () => {}, signal = null }) {
+  const prompt = buildEpisodePrompt({ ctx, interrupt });
+  reserve();
+  const { data, truncated, ms } = await callEpisode(prompt, signal);
+  const recent = interrupt ? [] : ctx.recent;
+  const episode = normalizeEpisode(data, { recent, truncated });
+  if (!episode) {
+    logUpstream('invalid', { model: getConfig().model, ms, lines: Array.isArray(data?.lines) ? data.lines.length : 0, truncated });
+    throw new AIError('bad_output', 'AI の会話記録の形式が正しくありませんでした。', { status: 502, retryable: true, source: 'gemini' });
   }
-  // calls: この発言のために使った API 呼び出し回数（クライアントが間隔の調整に使う）
-  return { ...turn, calls };
+  return { episode, calls: 1 };
 }
