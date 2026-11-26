@@ -20,7 +20,7 @@ const geminiOk = (obj, finishReason = 'STOP') => ({
   },
 });
 const geminiErr = (code, status, message) => ({ status: code, json: { error: { code, message, status } } });
-const turn = (utterance, extra = {}) => ({ utterance, expression: 'smile', intent: 'develop', topic: '雨', ...extra });
+const turn = (utterance, extra = {}) => ({ utterance, expression: 'smile', intent: 'develop', topic: '雨', genre: 'nature', after: 'pass', tempo: 'normal', note: '', ...extra });
 
 const freePort = () => new Promise((r) => { const s = http.createServer(); s.listen(0, '127.0.0.1', () => { const p = s.address().port; s.close(() => r(p)); }); });
 
@@ -81,9 +81,9 @@ test('serves the page with security headers; health check; blocks traversal', as
 test('turn: calls Gemini with JSON schema and system instruction; key stays server-side', async () => {
   requests.length = 0;
   queue.push(geminiOk(turn('雨の音って、なぜ落ち着くんだろう。', { expression: 'thinking' })));
-  const r = await post(base, '/api/turn', { speaker: 'A', log: [{ kind: 'say', speaker: 'B', text: '雨だねえ', topic: '雨' }] });
+  const r = await post(base, '/api/turn', { speaker: 'A', log: [{ kind: 'say', speaker: 'B', text: '雨だねえ', topic: '雨' }], context: { topics: [{ label: '雨の日', genre: 'nature' }], notes: { A: ['ミナは理由を聞きたがる'], B: ['秘密のメモ'] } } });
   assert.equal(r.status, 200);
-  assert.deepEqual(r.json, { text: '雨の音って、なぜ落ち着くんだろう。', expression: 'thinking', intent: 'develop', topic: '雨', demo: false });
+  assert.deepEqual(r.json, { text: '雨の音って、なぜ落ち着くんだろう。', expression: 'thinking', intent: 'develop', topic: '雨', genre: 'nature', after: 'pass', tempo: 'normal', note: '', calls: 1, demo: false });
   const req = requests[0];
   assert.match(req.url, /models\/test-model:generateContent/);
   assert.equal(req.headers['x-goog-api-key'], 'test-key');
@@ -91,6 +91,33 @@ test('turn: calls Gemini with JSON schema and system instruction; key stays serv
   assert.ok(req.body.generationConfig.responseJsonSchema.properties.utterance);
   assert.match(JSON.stringify(req.body.systemInstruction), /あなたは「レオ」/);
   assert.match(req.body.contents[0].parts[0].text, /雨だねえ/);
+  assert.match(req.body.contents[0].parts[0].text, /雨の日/);
+  assert.match(req.body.contents[0].parts[0].text, /ミナは理由を聞きたがる/);
+  assert.doesNotMatch(req.body.contents[0].parts[0].text, /秘密のメモ/);
+  assert.equal(req.body.generationConfig.maxOutputTokens, 2048);
+  assert.equal(req.body.generationConfig.thinkingConfig, undefined);
+});
+
+test('turn: truncated output (MAX_TOKENS) is a retryable error, not a crash', async () => {
+  queue.push(geminiOk(turn('途中で'), 'MAX_TOKENS'));
+  const r = await post(base, '/api/turn', { speaker: 'A', log: [] });
+  assert.equal(r.status, 502);
+  assert.equal(r.json.error.code, 'max_tokens');
+  assert.equal(r.json.error.retryable, true);
+});
+
+test('turn: network failure to Gemini maps to a retryable error', async () => {
+  const b = await startServer({ GEMINI_API_KEY: 'k', GOOGLE_GEMINI_BASE_URL: 'http://127.0.0.1:9' });
+  const r = await post(b, '/api/turn', { speaker: 'A', log: [] });
+  assert.ok(r.status >= 500);
+  assert.equal(r.json.error.retryable, true);
+});
+
+test('turn: optional thinking level is sent when configured', async () => {
+  const b = await startServer({ GEMINI_API_KEY: 'k', GEMINI_THINKING_LEVEL: 'low' });
+  requests.length = 0;
+  await post(b, '/api/turn', { speaker: 'A', log: [] });
+  assert.deepEqual(requests[0].body.generationConfig.thinkingConfig, { thinkingLevel: 'LOW' });
 });
 
 test('turn: duplicate utterance triggers exactly one regeneration', async () => {
@@ -100,6 +127,7 @@ test('turn: duplicate utterance triggers exactly one regeneration', async () => 
   const r = await post(base, '/api/turn', { speaker: 'B', log: [{ kind: 'say', speaker: 'B', text: '雨だねえ' }] });
   assert.equal(r.status, 200);
   assert.equal(r.json.text, 'パン屋さんの匂いがしてきた。');
+  assert.equal(r.json.calls, 2);
   assert.equal(requests.length, 2);
 });
 
@@ -110,13 +138,18 @@ test('turn: safety block is reported as a retryable 422', async () => {
   assert.equal(r.json.error.code, 'blocked');
 });
 
-test('turn: Gemini quota exhaustion is not retried and maps to upstream_quota', async () => {
+test('turn: Gemini 429 is not retried; daily vs per-minute quota are distinguished', async () => {
   requests.length = 0;
-  queue.push(geminiErr(429, 'RESOURCE_EXHAUSTED', 'Quota exceeded'));
+  queue.push(geminiErr(429, 'RESOURCE_EXHAUSTED', 'Quota exceeded for metric: generate_content_free_tier_requests, limit: 500, quotaId: GenerateRequestsPerDayPerProjectPerModel-FreeTier'));
   const r = await post(base, '/api/turn', { speaker: 'A', log: [] });
   assert.equal(r.status, 429);
   assert.equal(r.json.error.code, 'upstream_quota');
   assert.equal(requests.length, 1);
+  queue.push(geminiErr(429, 'RESOURCE_EXHAUSTED', 'Quota exceeded, quotaId: GenerateRequestsPerMinutePerProjectPerModel-FreeTier'));
+  const m = await post(base, '/api/turn', { speaker: 'A', log: [] });
+  assert.equal(m.json.error.code, 'upstream_busy');
+  assert.equal(m.json.error.retryable, true);
+  assert.equal(requests.length, 2);
 });
 
 test('turn: requests from other origins or without the app header are refused', async () => {

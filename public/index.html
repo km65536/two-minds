@@ -2,8 +2,10 @@
 <html lang="ja">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <meta name="theme-color" content="#151826">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+  <meta name="theme-color" content="#121524">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <title>TWO MINDS</title>
   <meta name="description" content="向かい合った二人のAIが、延々と話し続けるのを眺めるゲーム">
   <link rel="icon" href="icon.svg" type="image/svg+xml">
@@ -13,20 +15,59 @@
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
-<div class="app">
+<div class="app" id="app">
   <header class="topbar">
     <h1 class="title">TWO&nbsp;MINDS</h1>
     <span class="mode-badge" id="modeBadge" hidden title="AI ではなく、決まった文型で会話しています">DEMO</span>
     <span class="status" id="status" data-state="idle"><span class="dot"></span><span id="statusText">待機中</span></span>
   </header>
 
-  <main class="scene" id="scene">
+  <main class="stage" id="stage">
     <!-- 背景 -->
     <div class="backdrop" aria-hidden="true">
       <div class="window"><span class="moon"></span><span class="pane"></span></div>
       <div class="lamp"></div>
       <div class="floor"></div>
-      <svg class="table" viewBox="0 0 240 120">
+    </div>
+
+    <!-- 吹き出し -->
+    <div class="bubbles" id="bubbles" aria-live="polite"></div>
+
+    <!-- キャラクター -->
+    <div class="cast">
+      <!-- レオ（左） -->
+      <figure class="char" id="charA" data-who="A" data-expr="neutral" data-shape="neutral">
+        <svg class="figure" viewBox="0 0 200 260" aria-hidden="true">
+          <g class="body">
+            <path class="torso" d="M24 260 C26 206 58 186 100 186 C142 186 174 206 176 260 Z"/>
+            <path class="collar" d="M78 190 L100 214 L122 190"/>
+            <rect class="skin" x="89" y="158" width="22" height="32" rx="8"/>
+          </g>
+          <g class="head">
+            <path class="hair-back" d="M50 104 C46 54 78 40 104 42 C134 44 156 64 152 108 L146 96 L58 96 Z"/>
+            <ellipse class="skin ear" cx="56" cy="114" rx="8" ry="12"/>
+            <ellipse class="skin ear" cx="150" cy="114" rx="8" ry="12"/>
+            <ellipse class="skin face" cx="103" cy="112" rx="47" ry="53"/>
+            <path class="hair" d="M54 102 C52 60 84 44 110 46 C138 48 158 70 152 104 C144 88 132 76 116 72 C110 84 92 90 74 88 C66 90 58 96 54 102 Z"/>
+            <path class="hair tuft" d="M104 46 q6 -14 18 -12 q-8 4 -8 14z"/>
+            <g class="cheeks"><ellipse cx="78" cy="132" rx="9" ry="5"/><ellipse cx="134" cy="132" rx="9" ry="5"/></g>
+            <g class="brows"><path class="brow l" d="M72 94 q10 -6 20 -1"/><path class="brow r" d="M116 93 q10 -5 20 1"/></g>
+            <g class="eyes"><ellipse class="eye l" cx="86" cy="113" rx="5.5" ry="7"/><ellipse class="eye r" cx="126" cy="113" rx="5.5" ry="7"/></g>
+            <g class="eyes-closed"><path d="M79 114 q7 -7 14 0"/><path d="M119 114 q7 -7 14 0"/></g>
+            <g class="mouth">
+              <path class="m m-neutral" d="M95 144 q9 2 18 0"/>
+              <path class="m m-smile" d="M92 141 q12 11 24 0"/>
+              <path class="m m-frown" d="M94 147 q10 -7 20 0"/>
+              <ellipse class="m m-o fill" cx="104" cy="146" rx="5" ry="6"/>
+              <path class="m m-mid fill" d="M94 142 q10 2 20 0 q-2 8 -10 8 q-8 0 -10 -8z"/>
+              <path class="m m-open fill" d="M93 140 q11 3 22 0 q-2 14 -11 14 q-9 0 -11 -14z"/>
+            </g>
+          </g>
+        </svg>
+        <figcaption class="nameplate">レオ</figcaption>
+      </figure>
+
+      <svg class="table" viewBox="0 0 240 120" aria-hidden="true">
         <ellipse cx="120" cy="22" rx="110" ry="18" class="tbl-top"/>
         <path d="M112 36 L106 120 M128 36 L134 120" class="tbl-leg"/>
         <path d="M70 6 h22 v14 a11 6 0 0 1 -22 0z" class="cup"/>
@@ -34,81 +75,51 @@
         <path class="steam" d="M78 0 q-4 -8 0 -14 q4 -6 0 -12"/>
         <path class="steam s2" d="M160 0 q-4 -8 0 -14 q4 -6 0 -12"/>
       </svg>
+
+      <!-- ミナ（右） -->
+      <figure class="char" id="charB" data-who="B" data-expr="neutral" data-shape="neutral">
+        <svg class="figure" viewBox="0 0 200 260" aria-hidden="true">
+          <g class="body">
+            <path class="torso" d="M26 260 C28 208 60 188 100 188 C140 188 172 208 174 260 Z"/>
+            <path class="collar" d="M84 192 q16 14 32 0"/>
+            <rect class="skin" x="89" y="160" width="22" height="32" rx="8"/>
+          </g>
+          <g class="head">
+            <path class="hair-back" d="M44 150 C30 70 64 42 98 42 C134 42 168 70 154 150 C150 132 146 118 140 108 L60 108 C54 118 50 132 44 150 Z"/>
+            <ellipse class="skin ear" cx="52" cy="116" rx="7" ry="11"/>
+            <ellipse class="skin ear" cx="146" cy="116" rx="7" ry="11"/>
+            <ellipse class="skin face" cx="97" cy="114" rx="46" ry="52"/>
+            <path class="hair" d="M50 112 C44 62 74 46 98 46 C126 46 152 62 148 112 C144 96 136 84 126 80 C118 92 106 88 100 80 C92 90 78 92 66 86 C58 94 52 104 50 112 Z"/>
+            <path class="clip" d="M128 70 l12 -6 l3 6 l-12 6z"/>
+            <g class="cheeks"><ellipse cx="72" cy="134" rx="9" ry="5"/><ellipse cx="124" cy="134" rx="9" ry="5"/></g>
+            <g class="brows"><path class="brow l" d="M64 95 q9 -4 18 0"/><path class="brow r" d="M108 95 q9 -4 18 0"/></g>
+            <g class="eyes"><ellipse class="eye l" cx="74" cy="116" rx="5" ry="6.5"/><ellipse class="eye r" cx="116" cy="116" rx="5" ry="6.5"/></g>
+            <g class="eyes-closed"><path d="M67 117 q7 -7 14 0"/><path d="M109 117 q7 -7 14 0"/></g>
+            <g class="glasses"><circle cx="74" cy="116" r="14"/><circle cx="116" cy="116" r="14"/><path d="M88 115 q7 -4 14 0"/></g>
+            <g class="mouth">
+              <path class="m m-neutral" d="M88 146 q8 2 16 0"/>
+              <path class="m m-smile" d="M85 143 q11 11 22 0"/>
+              <path class="m m-frown" d="M87 149 q9 -6 18 0"/>
+              <ellipse class="m m-o fill" cx="96" cy="148" rx="5" ry="6"/>
+              <path class="m m-mid fill" d="M86 144 q10 2 20 0 q-2 8 -10 8 q-8 0 -10 -8z"/>
+              <path class="m m-open fill" d="M85 142 q11 3 22 0 q-2 14 -11 14 q-9 0 -11 -14z"/>
+            </g>
+          </g>
+        </svg>
+        <figcaption class="nameplate">ミナ</figcaption>
+      </figure>
     </div>
-
-    <!-- 吹き出し -->
-    <div class="bubbles" id="bubbles" aria-live="polite"></div>
-
-    <!-- レオ（左） -->
-    <figure class="char" id="charA" data-who="A" data-expr="neutral" data-shape="neutral">
-      <svg class="figure" viewBox="0 0 200 260" aria-hidden="true">
-        <g class="body">
-          <path class="torso" d="M24 260 C26 206 58 186 100 186 C142 186 174 206 176 260 Z"/>
-          <path class="collar" d="M78 190 L100 214 L122 190"/>
-          <rect class="skin" x="89" y="158" width="22" height="32" rx="8"/>
-        </g>
-        <g class="head">
-          <path class="hair-back" d="M50 104 C46 54 78 40 104 42 C134 44 156 64 152 108 L146 96 L58 96 Z"/>
-          <ellipse class="skin ear" cx="56" cy="114" rx="8" ry="12"/>
-          <ellipse class="skin ear" cx="150" cy="114" rx="8" ry="12"/>
-          <ellipse class="skin face" cx="103" cy="112" rx="47" ry="53"/>
-          <path class="hair" d="M54 102 C52 60 84 44 110 46 C138 48 158 70 152 104 C144 88 132 76 116 72 C110 84 92 90 74 88 C66 90 58 96 54 102 Z"/>
-          <g class="cheeks"><ellipse cx="78" cy="132" rx="9" ry="5"/><ellipse cx="134" cy="132" rx="9" ry="5"/></g>
-          <g class="brows"><path class="brow l" d="M72 92 q10 -6 20 -1"/><path class="brow r" d="M116 91 q10 -5 20 1"/></g>
-          <g class="eyes"><ellipse class="eye l" cx="84" cy="112" rx="5" ry="6.5"/><ellipse class="eye r" cx="126" cy="112" rx="5" ry="6.5"/></g>
-          <g class="eyes-closed"><path d="M77 113 q7 -7 14 0"/><path d="M119 113 q7 -7 14 0"/></g>
-          <g class="glasses"><circle cx="84" cy="112" r="14"/><circle cx="126" cy="112" r="14"/><path d="M98 111 q7 -4 14 0"/></g>
-          <g class="mouth">
-            <path class="m m-neutral" d="M95 144 q9 2 18 0"/>
-            <path class="m m-smile" d="M92 141 q12 11 24 0"/>
-            <path class="m m-frown" d="M94 147 q10 -7 20 0"/>
-            <ellipse class="m m-o fill" cx="104" cy="146" rx="5" ry="6"/>
-            <path class="m m-mid fill" d="M94 142 q10 2 20 0 q-2 8 -10 8 q-8 0 -10 -8z"/>
-            <path class="m m-open fill" d="M93 140 q11 3 22 0 q-2 14 -11 14 q-9 0 -11 -14z"/>
-          </g>
-        </g>
-      </svg>
-      <figcaption class="nameplate">レオ</figcaption>
-    </figure>
-
-    <!-- ミナ（右） -->
-    <figure class="char" id="charB" data-who="B" data-expr="neutral" data-shape="neutral">
-      <svg class="figure" viewBox="0 0 200 260" aria-hidden="true">
-        <g class="body">
-          <path class="torso" d="M26 260 C28 208 60 188 100 188 C140 188 172 208 174 260 Z"/>
-          <path class="collar" d="M84 192 q16 14 32 0"/>
-          <rect class="skin" x="89" y="160" width="22" height="32" rx="8"/>
-        </g>
-        <g class="head">
-          <path class="hair-back" d="M44 150 C30 70 64 42 98 42 C134 42 168 70 154 150 C150 132 146 118 140 108 L60 108 C54 118 50 132 44 150 Z"/>
-          <ellipse class="skin ear" cx="52" cy="116" rx="7" ry="11"/>
-          <ellipse class="skin ear" cx="146" cy="116" rx="7" ry="11"/>
-          <ellipse class="skin face" cx="97" cy="114" rx="46" ry="52"/>
-          <path class="hair" d="M50 112 C44 62 74 46 98 46 C126 46 152 62 148 112 C144 96 136 84 126 80 C118 92 106 88 100 80 C92 90 78 92 66 86 C58 94 52 104 50 112 Z"/>
-          <path class="clip" d="M128 70 l12 -6 l3 6 l-12 6z"/>
-          <g class="cheeks"><ellipse cx="72" cy="134" rx="9" ry="5"/><ellipse cx="124" cy="134" rx="9" ry="5"/></g>
-          <g class="brows"><path class="brow l" d="M66 96 q9 -4 18 0"/><path class="brow r" d="M108 96 q9 -4 18 0"/></g>
-          <g class="eyes"><ellipse class="eye l" cx="76" cy="116" rx="5.5" ry="7"/><ellipse class="eye r" cx="116" cy="116" rx="5.5" ry="7"/></g>
-          <g class="eyes-closed"><path d="M69 117 q7 -7 14 0"/><path d="M109 117 q7 -7 14 0"/></g>
-          <g class="mouth">
-            <path class="m m-neutral" d="M88 146 q8 2 16 0"/>
-            <path class="m m-smile" d="M85 143 q11 11 22 0"/>
-            <path class="m m-frown" d="M87 149 q9 -6 18 0"/>
-            <ellipse class="m m-o fill" cx="96" cy="148" rx="5" ry="6"/>
-            <path class="m m-mid fill" d="M86 144 q10 2 20 0 q-2 8 -10 8 q-8 0 -10 -8z"/>
-            <path class="m m-open fill" d="M85 142 q11 3 22 0 q-2 14 -11 14 q-9 0 -11 -14z"/>
-          </g>
-        </g>
-      </svg>
-      <figcaption class="nameplate">ミナ</figcaption>
-    </figure>
 
     <!-- 開始・一時停止時の案内 -->
     <div class="overlay" id="overlay">
       <div class="card">
         <p class="card-title" id="overlayTitle">二人は、まだ黙っている。</p>
-        <p class="card-text" id="overlayText">理屈っぽいレオと、マイペースなミナ。<br>二人の会話を、ただ眺めていてください。ときどき口を挟んでもかまいません。</p>
-        <button class="btn primary" id="overlayBtn">会話をはじめる</button>
+        <p class="card-text" id="overlayText">ひらめきのレオと、分析のミナ。<br>二人の会話を眺めていてください。<br>好きなときに、話しかけてもかまいません。</p>
+        <p class="card-note" id="overlayNote" hidden></p>
+        <div class="card-actions">
+          <button class="btn primary" id="overlayBtn">会話をはじめる</button>
+          <button class="btn ghost" id="overlayAlt" hidden>新しい会話をはじめる</button>
+        </div>
       </div>
     </div>
   </main>
