@@ -18,7 +18,7 @@ try {
 const { generateTurn, hasCredentials, getConfig, AIError } = await import('./ai.mjs');
 const { demoTurn } = await import('./demo.mjs');
 const { sanitizeLog, sanitizeContext, PLAYER_MAX } = await import('./conversation.mjs');
-const { Limiter, limitsFromEnv } = await import('./limits.mjs');
+const { Limiter, limitsFromEnv, UpstreamGate, isUpstreamTransient } = await import('./limits.mjs');
 
 const PUBLIC_DIR = path.join(root, 'public');
 const PORT = Number(process.env.PORT) || 3000;
@@ -27,6 +27,10 @@ const HOST = process.env.HOST || (process.env.RENDER ? '0.0.0.0' : '127.0.0.1');
 const MAX_BODY = 24 * 1024;
 const AI_ENABLED = (process.env.AI_ENABLED ?? 'true').toLowerCase() !== 'false';
 const limiter = new Limiter(limitsFromEnv());
+const gate = new UpstreamGate({
+  baseMs: Number(process.env.UPSTREAM_COOLDOWN_BASE_MS) || 4000,
+  maxMs: Number(process.env.UPSTREAM_COOLDOWN_MAX_MS) || 60_000,
+});
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -133,11 +137,21 @@ async function handleApi(req, res, url) {
 
     if (!AI_ENABLED) throw new AIError('disabled', 'AI 会話は現在停止しています。', { status: 503 });
     if (!hasCredentials()) throw new AIError('no_key', 'サーバーに API キーが設定されていません。', { status: 503 });
+    // Gemini が混雑中なら、呼ばずに待ち時間を返す（上限の回数も消費しない）
+    gate.check();
     const ip = clientIp(req);
     const end = limiter.begin(ip);
     try {
-      const turn = await generateTurn({ speaker, log, ctx, reserve: () => limiter.take(ip) });
+      const turn = await generateTurn({ speaker, log, ctx, reserve: () => limiter.take(ip), allowRegenerate: gate.failures === 0 });
+      gate.onSuccess();
       return send(res, 200, { ...turn, demo: false });
+    } catch (err) {
+      if (isUpstreamTransient(err)) {
+        const wait = gate.onFailure(err.upstream?.httpStatus ? `HTTP ${err.upstream.httpStatus}${err.upstream.status ? ` ${err.upstream.status}` : ''}` : err.upstream?.status || err.code, err.retryAfterMs);
+        err.retryAfterMs = Math.max(err.retryAfterMs || 0, wait);
+        console.warn(`[gemini] cooldown ${wait}ms after ${err.code} (consecutive failures: ${gate.failures})`);
+      }
+      throw err;
     } finally {
       end();
     }
@@ -179,8 +193,11 @@ const server = http.createServer(async (req, res) => {
   } catch (err) {
     const e = err instanceof AIError ? err : new AIError('internal', 'サーバー内部でエラーが発生しました。', { status: 500 });
     if (!(err instanceof AIError)) console.error(err);
-    else if (e.status >= 500 || e.code === 'upstream_quota') console.warn(`[${e.code}] ${e.message}`);
-    if (!res.headersSent) send(res, e.status, { error: { code: e.code, message: e.message, retryable: e.retryable } });
+    else if (e.status >= 500 || e.code === 'upstream_quota') console.warn(`[${e.code}] (${e.source}) ${e.message}`);
+    const headers = e.retryAfterMs ? { 'Retry-After': String(Math.ceil(e.retryAfterMs / 1000)) } : {};
+    if (!res.headersSent) {
+      send(res, e.status, { error: { code: e.code, message: e.message, retryable: e.retryable, source: e.source, retryAfterMs: e.retryAfterMs || undefined, upstreamStatus: e.upstream?.httpStatus ?? undefined } }, headers);
+    }
   }
 });
 server.requestTimeout = 45_000;
