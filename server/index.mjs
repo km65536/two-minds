@@ -15,8 +15,8 @@ try {
   /* .env が無い場合は環境変数のみを使う */
 }
 
-const { generateEpisode, hasCredentials, getConfig, AIError, SupersededError } = await import('./ai.mjs');
-const { demoEpisode } = await import('./demo.mjs');
+const { generateChunk, hasCredentials, getConfig, AIError, SupersededError } = await import('./ai.mjs');
+const { demoChunk } = await import('./demo.mjs');
 const { sanitizeContext, sanitizeInterrupt, PLAYER_MAX } = await import('./conversation.mjs');
 const { Limiter, limitsFromEnv, UpstreamGate, isUpstreamTransient } = await import('./limits.mjs');
 
@@ -24,7 +24,7 @@ const PUBLIC_DIR = path.join(root, 'public');
 const PORT = Number(process.env.PORT) || 3000;
 // Render では外部から届くよう 0.0.0.0 で待ち受ける。ローカルでは自分の PC からのみ。
 const HOST = process.env.HOST || (process.env.RENDER ? '0.0.0.0' : '127.0.0.1');
-const MAX_BODY = 48 * 1024;
+const MAX_BODY = 32 * 1024;
 const AI_ENABLED = (process.env.AI_ENABLED ?? 'true').toLowerCase() !== 'false';
 const limiter = new Limiter(limitsFromEnv());
 const gate = new UpstreamGate({
@@ -132,19 +132,21 @@ async function handleApi(req, res, url) {
       playerMax: PLAYER_MAX,
       // クライアントが自分で間隔を調整し、上限にぶつからないようにするための目安
       pace: { perMinute: limiter.o.ipRpmLimit, minIntervalMs: limiter.o.ipMinIntervalMs },
-      maxLines: 36,
+      chunk: { target: 3, max: 5 },
     });
   }
 
-  // 一連の会話記録（エピソード）をまとめて生成する。発言ごとの通信はしない
-  if (url.pathname === '/api/episode' && req.method === 'POST') {
+  // 会話の続き（原則 3 発言）をまとめて生成する。発言ごとの通信はしない。
+  // クライアントは再生中に次の分を 1 件だけ先読みする。rid（リクエスト番号）と gen（会話の世代）はそのまま返す
+  if (url.pathname === '/api/chunk' && req.method === 'POST') {
     checkCaller(req);
     const body = await readJSON(req);
     const ctx = sanitizeContext(body.context);
     const interrupt = sanitizeInterrupt(body.interrupt);
     const session = sessionId(req);
     const gen = Number.isFinite(body.gen) ? body.gen : 0;
-    if (body.mode === 'demo') return send(res, 200, { episode: demoEpisode({ ctx, interrupt }), demo: true, gen, calls: 0 });
+    const rid = Number.isFinite(body.rid) ? body.rid : 0;
+    if (body.mode === 'demo') return send(res, 200, { chunk: demoChunk({ ctx, interrupt }), demo: true, gen, rid, calls: 0 });
 
     if (!AI_ENABLED) throw new AIError('disabled', 'AI 会話は現在停止しています。', { status: 503 });
     if (!hasCredentials()) throw new AIError('no_key', 'サーバーに API キーが設定されていません。', { status: 503 });
@@ -163,9 +165,9 @@ async function handleApi(req, res, url) {
     const controller = new AbortController();
     inflight.set(session, controller);
     try {
-      const { episode, calls } = await generateEpisode({ ctx, interrupt, reserve: () => limiter.take(ip), signal: controller.signal });
+      const { chunk, calls } = await generateChunk({ ctx, interrupt, reserve: () => limiter.take(ip), signal: controller.signal });
       gate.onSuccess();
-      return send(res, 200, { episode, demo: false, gen, calls });
+      return send(res, 200, { chunk, demo: false, gen, rid, calls });
     } catch (err) {
       if (err instanceof SupersededError) throw new AIError('superseded', '新しい会話の生成に切り替えました。', { status: 409 });
       if (err?.code === 'schema_rejected') {

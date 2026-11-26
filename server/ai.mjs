@@ -1,6 +1,6 @@
 // Gemini API 呼び出し。API キーはサーバー側の環境変数からのみ読み込む。
 import { GoogleGenAI, ApiError } from '@google/genai';
-import { buildEpisodePrompt, EPISODE_SCHEMA, normalizeModelEpisode, salvageEpisode } from './conversation.mjs';
+import { buildChunkPrompt, CHUNK_SCHEMA, normalizeChunk, salvageChunk } from './conversation.mjs';
 
 export class AIError extends Error {
   /**
@@ -56,8 +56,8 @@ export function logUpstream(kind, fields) {
 export function getConfig() {
   return {
     model: process.env.GEMINI_MODEL?.trim() || 'gemini-3.5-flash-lite',
-    // 出力トークンの上限。一連の会話記録（最大 36 発言）をまとめて書くので、思考トークンも含めて余裕を持たせる
-    maxOutputTokens: Number(process.env.GEMINI_MAX_OUTPUT_TOKENS) || 8192,
+    // 出力トークンの上限。1 回に書くのは数発言と会話の状態だけだが、思考トークンも含むので余裕を持たせる
+    maxOutputTokens: Number(process.env.GEMINI_MAX_OUTPUT_TOKENS) || 4096,
     // 思考の深さ（例: low）。未設定なら送らず、モデルの既定値を使う
     thinkingLevel: (process.env.GEMINI_THINKING_LEVEL || '').trim().toUpperCase(), // MINIMAL / LOW / MEDIUM / HIGH
     // 出力形式の指定方法。schema = 簡略化した JSON Schema を送る（既定）/ json = スキーマを送らず JSON 出力だけを指定する
@@ -79,7 +79,7 @@ function getClient() {
       apiKey: apiKey(),
       // 無料枠を浪費しないよう、SDK 側の自動リトライは行わない
       // 1 回の呼び出しの制限時間。混雑時は応答が遅くなるので、短すぎない値にしている
-      httpOptions: { timeout: Number(process.env.GEMINI_TIMEOUT_MS) || 60_000, retryOptions: { attempts: 1 } },
+      httpOptions: { timeout: Number(process.env.GEMINI_TIMEOUT_MS) || 30_000, retryOptions: { attempts: 1 } },
     });
   }
   return client;
@@ -92,7 +92,7 @@ export class SupersededError extends Error {}
  * 1 回だけ呼び出し、会話記録の JSON を返す。
  * 出力が上限で途中で切れた（MAX_TOKENS）ときは、完全な発言だけを取り出して返す（追加の呼び出しはしない）。
  */
-async function callEpisode({ system, user }, signal) {
+async function callChunk({ system, user }, signal) {
   const cfg = getConfig();
   const started = Date.now();
   let res;
@@ -103,7 +103,7 @@ async function callEpisode({ system, user }, signal) {
       config: {
         systemInstruction: system,
         responseMimeType: 'application/json',
-        ...(cfg.schemaMode === 'schema' ? { responseJsonSchema: EPISODE_SCHEMA } : {}),
+        ...(cfg.schemaMode === 'schema' ? { responseJsonSchema: CHUNK_SCHEMA } : {}),
         maxOutputTokens: cfg.maxOutputTokens,
         temperature: 1.0,
         ...(cfg.thinkingLevel ? { thinkingConfig: { thinkingLevel: cfg.thinkingLevel } } : {}),
@@ -142,16 +142,16 @@ async function callEpisode({ system, user }, signal) {
     throw new AIError('blocked', 'この流れの会話は生成できませんでした。別の話にして続けます。', { status: 422, retryable: true, source: 'gemini' });
   }
   if (finish === 'MAX_TOKENS') {
-    const partial = salvageEpisode(text);
+    const partial = salvageChunk(text);
     logUpstream('finish', { model: cfg.model, ms, finishReason: finish, salvagedLines: partial?.lines?.length ?? 0 });
     if (partial?.lines?.length) return { data: partial, truncated: true, ms };
-    throw new AIError('max_tokens', '会話の記録が途中で切れてしまいました。', { status: 502, retryable: true, source: 'gemini' });
+    throw new AIError('max_tokens', '会話の続きが途中で切れてしまいました。', { status: 502, retryable: true, source: 'gemini' });
   }
   try {
     return { data: JSON.parse(text), truncated: false, ms };
   } catch {
     // 形式が崩れていても、読める発言があれば使う
-    const partial = salvageEpisode(text);
+    const partial = salvageChunk(text);
     logUpstream('bad_json', { model: cfg.model, ms, length: text.length, salvagedLines: partial?.lines?.length ?? 0 });
     if (partial?.lines?.length) return { data: partial, truncated: true, ms };
     throw new AIError('bad_output', 'AI の応答を読み取れませんでした。', { status: 502, retryable: true, source: 'gemini' });
@@ -194,18 +194,17 @@ export function toAIError(err) {
 }
 
 /**
- * 一連の会話記録（エピソード）を 1 回の呼び出しで生成する。
+ * 会話の続き（原則 3 発言、2〜5 発言）と、その時点の会話の状態を 1 回の呼び出しで生成する。
  * reserve() は API を呼ぶ直前に呼ばれ、上限を超えていれば例外を投げる。作り直しの呼び出しはしない。
  */
-export async function generateEpisode({ ctx, interrupt = null, reserve = () => {}, signal = null }) {
-  const prompt = buildEpisodePrompt({ ctx, interrupt });
+export async function generateChunk({ ctx, interrupt = null, reserve = () => {}, signal = null }) {
+  const prompt = buildChunkPrompt({ ctx, interrupt });
   reserve();
-  const { data, truncated, ms } = await callEpisode(prompt, signal);
-  const recent = interrupt ? [] : ctx.recent;
-  const episode = normalizeModelEpisode(data, { recent, truncated });
-  if (!episode) {
+  const { data, truncated, ms } = await callChunk(prompt, signal);
+  const chunk = normalizeChunk(data, { prev: ctx.state, recent: ctx.recent, truncated });
+  if (!chunk) {
     logUpstream('invalid', { model: getConfig().model, ms, lines: Array.isArray(data?.lines) ? data.lines.length : 0, truncated });
-    throw new AIError('bad_output', 'AI の会話記録の形式が正しくありませんでした。', { status: 502, retryable: true, source: 'gemini' });
+    throw new AIError('bad_output', 'AI の応答の形式が正しくありませんでした。', { status: 502, retryable: true, source: 'gemini' });
   }
-  return { episode, calls: 1 };
+  return { chunk, calls: 1 };
 }

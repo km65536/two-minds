@@ -1,6 +1,6 @@
 // デモモード：API キー無しで画面の動作を確認するための、決まった筋書きの会話記録。
 // AI は一切使っていない。用意した台本を順番に返すだけで、会話の質は本物とは比べものにならない。
-import { normalizeEpisode } from './conversation.mjs';
+import { normalizeChunk } from './conversation.mjs';
 
 const L = (speaker, text, type = 'chat', phase = 'FREE', expression = 'neutral', action = 'none', pause = 'none') => ({ speaker, text, type, phase, expression, action, pause });
 
@@ -72,26 +72,54 @@ const SCRIPTS = [
   },
 ];
 
-let cursor = Math.floor(Math.random() * SCRIPTS.length);
-
-export function demoEpisode({ ctx, interrupt }) {
+/**
+ * デモの台本を、本物と同じように「数発言ずつ」返す。台本のどこまで進んだかは state.cursor（"台本番号:位置"）で持つ。
+ * 出力は Gemini と同じ平らな形にして、本物と同じ検証（normalizeChunk）を通す。
+ */
+export function demoChunk({ ctx, interrupt }) {
+  const prev = ctx.state;
   if (interrupt) {
     const t = interrupt.text.slice(0, 30);
-    const q = interrupt.problem?.question;
-    return normalizeEpisode({
-      summary: `観察者の「${t}」に反応した。`,
-      topic: interrupt.problem ? 'さっきの続き' : '観察者の話',
-      problem: interrupt.problem ? { exists: true, ...interrupt.problem, status: 'continuing' } : { exists: false },
-      lines: [
-        L('A', `お、「${t}」だって。`, 'answer_player', 'EXPLORATION', 'surprised', 'tilt'),
-        L('B', 'その視点はなかった。少し考えさせて。', 'answer_player', 'EXPLORATION', 'thinking', 'think', 'short'),
-        L('A', q ? `じゃあ、「${q}」も見方が変わるかもね。` : 'せっかくだし、その話をもう少し聞いてみたいな。', 'insight', 'EXPLORATION', 'smile', 'lean'),
-        L('B', 'うん。あとで、ちゃんと確かめよう。', 'agree', 'AFTERMATH', 'smile', 'nod'),
-      ],
-      next: { hook: '', deferred_questions: [], continue_problem: !!interrupt.problem },
-    });
+    const q = prev.question;
+    return normalizeChunk(
+      flat({ question: q, status: q ? 'exploring' : 'none', topic: prev.topic || '観察者の話', summary: `観察者の「${t}」に反応した`, boundary: 'no', cursor: prev.cursor }, [
+        L('A', `お、「${t}」だって。`, 'answer_player', prev.phase === 'FREE' ? 'FREE' : 'EXPLORATION', 'surprised', 'tilt'),
+        L('B', q ? `その話、「${q}」にも関係しそう。少し考えさせて。` : 'その視点はなかった。少し考えさせて。', 'answer_player', prev.phase === 'FREE' ? 'FREE' : 'EXPLORATION', 'thinking', 'think', 'short'),
+        L('A', 'うん、あとでちゃんと確かめよう。', 'agree', prev.phase === 'FREE' ? 'FREE' : 'EXPLORATION', 'smile', 'nod'),
+      ]),
+      { prev, recent: [] },
+    );
   }
-  const script = SCRIPTS[cursor % SCRIPTS.length];
-  cursor++;
-  return normalizeEpisode(script, { recent: ctx?.recent || [] }) || normalizeEpisode(script);
+  let [si, pos] = (prev.cursor || '').split(':').map((x) => Number.parseInt(x, 10));
+  if (!Number.isFinite(si) || !SCRIPTS[si]) [si, pos] = [Math.floor(Math.random() * SCRIPTS.length), 0];
+  if (!Number.isFinite(pos) || pos >= SCRIPTS[si].lines.length) [si, pos] = [(si + 1) % SCRIPTS.length, 0];
+  const script = SCRIPTS[si];
+  const lines = script.lines.slice(pos, pos + 3);
+  const end = pos + lines.length >= script.lines.length;
+  const p = script.problem;
+  const raw = flat(
+    {
+      topic: script.topic,
+      summary: script.summary,
+      question: p.exists && lines.some((l) => l.phase !== 'FREE') ? p.question : prev.question,
+      status: end ? p.status : p.exists ? 'exploring' : 'none',
+      leo_view: p.leo_view,
+      mina_view: p.mina_view,
+      known: end ? p.conclusion : '',
+      open_points: (p.open_points || []).join(' / '),
+      deferred: end ? (script.next.deferred_questions || []).join(' / ') : '',
+      boundary: end ? 'yes' : 'no',
+    },
+    lines,
+  );
+  const chunk = normalizeChunk(raw, { prev, recent: ctx.recent }) || normalizeChunk(raw, { prev });
+  if (chunk) chunk.state.cursor = `${si}:${pos + lines.length}`;
+  return chunk;
+}
+
+function flat(fields, lines) {
+  return {
+    ...fields,
+    lines: lines.map((l) => ({ speaker: l.speaker, text: l.text, expression: l.expression, action: l.action, tag: `${l.phase} ${l.type} ${l.pause}` })),
+  };
 }

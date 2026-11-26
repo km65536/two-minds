@@ -16,17 +16,23 @@ let base;
 
 // Gemini が返す平らな形（簡略化したスキーマどおり）
 const line = (speaker, text, extra = {}) => ({ speaker, text, expression: 'neutral', action: 'none', tag: 'FREE chat none', ...extra });
-const episode = (lines = [line('A', 'お茶、ぬるくなっちゃった'), line('B', 'ほんとだ。なんでぬるいとまずいんだろう', { tag: 'DISCOVERY question' })], extra = {}) => ({
-  summary: 'ぬるいお茶の話',
+// Gemini が返す「続きの数発言＋会話の状態」（簡略化したスキーマどおりの平らな形）
+const episode = (lines = [line('A', 'お茶、ぬるくなっちゃった'), line('B', 'ほんとだ。なんでぬるいとまずいんだろう', { tag: 'DISCOVERY discovery' }), line('A', '期待とのズレかな', { tag: 'EXPLORATION hypothesis' })], extra = {}) => ({
+  lines,
   topic: 'お茶',
+  summary: 'ぬるいお茶の話',
   question: 'ぬるいお茶はなぜまずいか',
-  status: 'continuing',
+  kind: '科学',
+  status: 'exploring',
   leo_view: '期待とのズレ',
   mina_view: '香り',
   explored: '',
-  conclusion: '',
-  lines,
+  known: '',
+  open_points: '温度と香りの関係',
+  next_focus: '香りを確かめる',
   deferred: '',
+  mood: 'のんびり',
+  boundary: 'no',
   note_leo: '',
   note_mina: '',
   ...extra,
@@ -86,7 +92,7 @@ after(() => { for (const s of servers) s.kill(); mock?.close(); });
 
 let sessionSeq = 0;
 const H = () => ({ 'content-type': 'application/json', 'x-two-minds': '1', 'x-two-minds-session': `test-session-${++sessionSeq}-abcdef` });
-const post = async (b, body, headers = H(), p = '/api/episode') => {
+const post = async (b, body, headers = H(), p = '/api/chunk') => {
   const r = await fetch(b + p, { method: 'POST', headers, body: JSON.stringify(body) });
   return { status: r.status, json: await r.json(), headers: r.headers };
 };
@@ -109,20 +115,21 @@ test('serves the page with security headers; health check; blocks traversal', as
   assert.notEqual((await fetch(base + '/..%2F.env.example')).status, 200);
 });
 
-test('per-utterance endpoint is gone', async () => {
-  const r = await post(base, { speaker: 'A', log: [] }, H(), '/api/turn');
-  assert.equal(r.status, 404);
+test('per-utterance and whole-episode endpoints are gone', async () => {
+  assert.equal((await post(base, { speaker: 'A', log: [] }, H(), '/api/turn')).status, 404);
+  assert.equal((await post(base, { context: {} }, H(), '/api/episode')).status, 404);
 });
 
 // ---------- 会話記録の生成 ----------
 
-test('episode: one Gemini call returns a whole validated conversation record', async () => {
+test('one Gemini call returns several lines (standard 3) plus the updated conversation state', async () => {
   requests.length = 0;
-  queue.push(geminiOk(episode([line('A', 'お茶、ぬるくなっちゃった', { expression: 'troubled', action: 'sip' }), line('B', 'ほんとだ。なんでぬるいとまずいんだろう', { tag: 'DISCOVERY question', expression: 'thinking' }), line('A', '期待とのズレかな', { tag: 'EXPLORATION hypothesis short' })])));
+  queue.push(geminiOk(episode([line('A', 'お茶、ぬるくなっちゃった', { expression: 'troubled', action: 'sip' }), line('B', 'ほんとだ。なんでぬるいとまずいんだろう', { tag: 'DISCOVERY discovery', expression: 'thinking' }), line('A', '期待とのズレかな', { tag: 'EXPLORATION hypothesis short' })])));
   const r = await post(base, {
     gen: 3,
+    rid: 17,
     context: {
-      history: [{ summary: '靴下の話をした', question: '靴下はなぜ消える', status: 'resolved', conclusion: '目立つだけ' }],
+      state: { topic: '靴下', summary: '靴下の話をした', question: '', status: 'none', phase: 'AFTERMATH', free_run: 1 },
       topics: ['靴下'],
       backlog: ['洗濯物はなぜからまる'],
       notes: { A: ['ミナは定義にこだわる'], B: ['レオはすぐ例え話にする'] },
@@ -131,43 +138,53 @@ test('episode: one Gemini call returns a whole validated conversation record', a
   });
   assert.equal(r.status, 200);
   assert.equal(requests.length, 1);
-  assert.equal(r.json.calls, 1);
-  assert.equal(r.json.gen, 3);
-  assert.equal(r.json.demo, false);
-  const ep = r.json.episode;
-  assert.equal(ep.lines.length, 3);
-  assert.deepEqual(ep.lines[2], { speaker: 'A', text: '期待とのズレかな', expression: 'neutral', action: 'none', type: 'hypothesis', phase: 'EXPLORATION', pause: 'short' });
-  assert.equal(ep.problem.status, 'continuing');
+  assert.deepEqual([r.json.calls, r.json.gen, r.json.rid, r.json.demo], [1, 3, 17, false]); // リクエスト番号と世代をそのまま返す
+  const c = r.json.chunk;
+  assert.equal(c.lines.length, 3);
+  assert.deepEqual(c.lines[2], { speaker: 'A', text: '期待とのズレかな', expression: 'neutral', action: 'none', type: 'hypothesis', phase: 'EXPLORATION', pause: 'short' });
+  assert.equal(c.state.question, 'ぬるいお茶はなぜまずいか');
+  assert.equal(c.state.status, 'exploring');
+  assert.deepEqual([c.state.leo_view, c.state.mina_view], ['期待とのズレ', '香り']);
+  assert.deepEqual(c.state.open_points, ['温度と香りの関係']);
+  assert.equal(c.state.next_focus, '香りを確かめる');
+  assert.equal(c.state.age, 1);
+  assert.equal(c.boundary, false);
   const req = requests[0];
   assert.match(req.url, /models\/test-model:generateContent/);
   assert.equal(req.headers['x-goog-api-key'], 'test-key');
   assert.equal(req.body.generationConfig.responseMimeType, 'application/json');
   const schema = req.body.generationConfig.responseJsonSchema;
-  assert.ok(schema.properties.lines);
-  assert.doesNotMatch(JSON.stringify(schema), /"enum"|"maxItems"|"minItems"/); // 簡略化したスキーマが送られている
-  assert.equal(req.body.generationConfig.maxOutputTokens, 8192);
+  assert.ok(schema.properties.lines && schema.properties.next_focus);
+  assert.doesNotMatch(JSON.stringify(schema), /"enum"|"maxItems"|"minItems"/); // 受け付けられた簡潔なスキーマのまま
+  assert.equal(req.body.generationConfig.maxOutputTokens, 4096);
   const sys = JSON.stringify(req.body.systemInstruction);
   assert.match(sys, /レオ/);
   assert.match(sys, /ミナ/);
   const user = req.body.contents[0].parts[0].text;
-  assert.match(user, /靴下の話をした/);
-  assert.match(user, /靴下の国はないよ/);
+  assert.match(user, /ここまでの流れ: 靴下の話をした/);
+  assert.match(user, /ミナ: 靴下の国はないよ/);
+  assert.match(user, /洗濯物はなぜからまる/);
   assert.match(user, /レオだけが覚えていること: ミナは定義にこだわる/);
+  assert.match(user, /原則 3 つ（2〜5 つ）/);
 });
 
-test('episode: the observer interrupt is sent with the played lines and current hypotheses', async () => {
+test('the observer interrupt is answered first, with the current problem and both opinions kept', async () => {
   requests.length = 0;
   queue.push(geminiOk(episode([line('B', '観察者さん、それほんと？', { tag: 'EXPLORATION answer_player' }), line('A', 'じゃあ僕の仮説は外れか', { tag: 'EXPLORATION concede' })])));
   const r = await post(base, {
-    context: { recent: [{ kind: 'say', speaker: 'A', text: '前の話' }] },
-    interrupt: { text: '答えは香りだよ', played: [{ kind: 'say', speaker: 'A', text: 'なんでぬるいとまずいの' }], problem: { question: 'ぬるいお茶はなぜまずいか', leo_view: '期待とのズレ', mina_view: '温度', status: 'exploring' } },
+    context: {
+      state: { question: 'ぬるいお茶はなぜまずいか', status: 'exploring', leo_view: '期待とのズレ', mina_view: '温度', phase: 'EXPLORATION' },
+      recent: [{ kind: 'say', speaker: 'A', text: 'なんでぬるいとまずいの' }, { kind: 'player', text: '答えは香りだよ' }],
+    },
+    interrupt: { text: '答えは香りだよ' },
   });
   assert.equal(r.status, 200);
-  assert.equal(r.json.episode.lines[0].type, 'answer_player');
+  assert.equal(r.json.chunk.lines[0].type, 'answer_player');
   const user = requests[0].body.contents[0].parts[0].text;
+  assert.match(user, /観察者がたった今「答えは香りだよ」と話しかけてきた/);
   assert.match(user, /観察者: 答えは香りだよ/);
   assert.match(user, /なんでぬるいとまずいの/);
-  assert.match(user, /レオの考え: 期待とのズレ/);
+  assert.match(user, /レオの今の考え: 期待とのズレ/);
 });
 
 test('only one generation per tab: a second plain request is refused, an interrupt supersedes the old one', async () => {
@@ -202,12 +219,12 @@ test('interrupts are not held back by the minimum interval (counts still apply)'
 
 test('truncated output (MAX_TOKENS): complete lines are salvaged without another call', async () => {
   requests.length = 0;
-  const full = JSON.stringify(episode([line('A', '一つ目の発言です'), line('B', '二つ目の発言です'), line('A', '三つ目は途中で切れる')]));
+  const full = JSON.stringify(episode([line('A', '一つ目の発言です'), line('B', '二つ目の発言です'), line('A', '三つ目は途中で切れる')]));  // 発言が先、状態が後
   queue.push(geminiText(full.slice(0, full.indexOf('三つ目は途中') + 2), 'MAX_TOKENS'));
   const r = await post(base, { context: {} });
   assert.equal(r.status, 200);
-  assert.equal(r.json.episode.lines.length, 2);
-  assert.equal(r.json.episode.truncated, true);
+  assert.equal(r.json.chunk.lines.length, 2);
+  assert.equal(r.json.chunk.truncated, true);
   assert.equal(requests.length, 1);
   await wait(30);
   assert.match(logText(base), /finishReason=MAX_TOKENS salvagedLines=2/);
@@ -219,7 +236,7 @@ test('invalid output is rejected as a retryable error and logged', async () => {
   assert.equal(r.status, 502);
   assert.equal(r.json.error.code, 'bad_output');
   assert.equal(r.json.error.retryable, true);
-  queue.push(geminiOk(episode([line('A', 'ひとつだけ'), { speaker: 'X', text: '' }])));
+  queue.push(geminiOk(episode([{ speaker: 'X', text: '' }, line('Z', '誰？'), line('A', '')])));
   const r2 = await post(base, { context: {} });
   assert.equal(r2.json.error.code, 'bad_output');
   await wait(30);
@@ -400,7 +417,7 @@ test('GEMINI_SCHEMA_MODE=json sends no schema (JSON output only) and still valid
   assert.equal(r.status, 200);
   assert.equal(requests[0].body.generationConfig.responseMimeType, 'application/json');
   assert.equal(requests[0].body.generationConfig.responseJsonSchema, undefined);
-  assert.deepEqual([r.json.episode.lines[1].expression, r.json.episode.lines[1].phase, r.json.episode.lines[1].type], ['smile', 'AFTERMATH', 'joke']);
+  assert.deepEqual([r.json.chunk.lines[1].expression, r.json.chunk.lines[1].phase, r.json.chunk.lines[1].type], ['smile', 'AFTERMATH', 'joke']);
 });
 
 // ---------- 安全機構 ----------
@@ -412,21 +429,21 @@ test('requests from other origins or without the app header are refused', async 
   assert.equal(requests.length, before);
 });
 
-test('demo mode never calls the API and returns a scripted episode', async () => {
+test('demo mode never calls the API and returns a scripted chunk', async () => {
   const before = requests.length;
   const r = await post(base, { mode: 'demo', context: {} });
   assert.equal(r.status, 200);
   assert.equal(r.json.demo, true);
-  assert.ok(r.json.episode.lines.length >= 2);
+  assert.ok(r.json.chunk.lines.length >= 1 && r.json.chunk.lines.length <= 3);
   const i = await post(base, { mode: 'demo', context: {}, interrupt: { text: 'やあ' } });
-  assert.match(i.json.episode.lines[0].text, /やあ/);
+  assert.match(i.json.chunk.lines[0].text, /やあ/);
   assert.equal(requests.length, before);
 });
 
 test('rejects oversized and malformed bodies', async () => {
-  const r = await fetch(base + '/api/episode', { method: 'POST', headers: H(), body: '{oops' });
+  const r = await fetch(base + '/api/chunk', { method: 'POST', headers: H(), body: '{oops' });
   assert.equal(r.status, 400);
-  const big = await fetch(base + '/api/episode', { method: 'POST', headers: H(), body: 'x'.repeat(128 * 1024) }).catch(() => ({ status: 413 }));
+  const big = await fetch(base + '/api/chunk', { method: 'POST', headers: H(), body: 'x'.repeat(128 * 1024) }).catch(() => ({ status: 413 }));
   assert.equal(big.status, 413);
 });
 

@@ -1,267 +1,269 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  fromModelOutput,
-  normalizeModelEpisode,
-  parseTag,
-  MODEL_FIELDS,
-  LINE_FIELDS,
   buildSystemPrompt,
-  buildEpisodePrompt,
+  buildChunkPrompt,
   sanitizeContext,
+  sanitizeState,
   sanitizeInterrupt,
-  normalizeEpisode,
-  salvageEpisode,
+  normalizeChunk,
+  mergeState,
+  salvageChunk,
+  parseTag,
   cleanText,
   similarity,
+  emptyState,
   CHARACTERS,
-  EPISODE_SCHEMA,
-  EPISODE_MAX_LINES,
+  CHUNK_SCHEMA,
+  MODEL_FIELDS,
+  LINE_FIELDS,
+  CHUNK_MAX_LINES,
+  LINE_MAX,
 } from '../server/conversation.mjs';
-import { demoEpisode } from '../server/demo.mjs';
+import { demoChunk } from '../server/demo.mjs';
 
 const rng = (v) => () => v;
-const line = (speaker, text, extra = {}) => ({ speaker, text, expression: 'neutral', action: 'none', type: 'chat', phase: 'FREE', pause: 'none', ...extra });
-const episode = (lines, extra = {}) => ({
-  summary: 'テスト',
-  topic: 'お茶',
-  problem: { exists: false, question: '', kind: 'none', status: 'none', leo_view: '', mina_view: '', explored: [], conclusion: '', unresolved_reason: '', open_points: [] },
-  lines,
-  next: { hook: '', deferred_questions: [], continue_problem: false },
-  notes: { A: '', B: '' },
-  ...extra,
-});
+// Gemini が実際に返す平らな形
+const L = (speaker, text, extra = {}) => ({ speaker, text, expression: 'neutral', action: 'none', tag: 'FREE chat none', ...extra });
+const out = (lines, extra = {}) => ({ lines, topic: 'お茶', summary: 'お茶の話', question: '', kind: '', status: 'none', leo_view: '', mina_view: '', explored: '', known: '', open_points: '', next_focus: '', deferred: '', mood: '', boundary: 'no', note_leo: '', note_mina: '', ...extra });
+const said = (lines) => lines.map((l) => ({ kind: 'say', speaker: l.speaker, text: l.text }));
 
-test('system prompt: both personas, equal intelligence, curiosity, plain language, phases and problem rules', () => {
+// ---------- 人格とプロンプト ----------
+
+test('system prompt: both personas, equal intelligence, curiosity, plain spoken language', () => {
   const p = buildSystemPrompt();
   for (const c of Object.values(CHARACTERS)) for (const t of c.traits) assert.ok(p.includes(t));
   assert.match(p, /上下はない/);
-  assert.match(p, /いつもレオがとっぴで、いつもミナが正しい、という形にしない/);
-  assert.match(p, /分からないことは分からないと言う/);
+  assert.match(p, /いつもレオがとっぴで、いつもミナが正しく訂正する、という形にしない/);
+  assert.match(p, /本当に納得したら、素直に同意する。無理に対立しない/);
+  assert.match(p, /分からないことは分からないと言う。事実と推測を区別する/);
   assert.match(p, /関係.*決めない/);
-  assert.match(p, /難しい言葉/);
-  for (const ph of ['FREE', 'DISCOVERY', 'EXPLORATION', 'RESOLUTION', 'AFTERMATH']) assert.match(p, new RegExp(ph));
-  assert.match(p, /最後まで取り組む/);
-  assert.match(p, /deferred_questions に入れて後回し/);
-  assert.match(p, /正確さを最優先/);
-  assert.match(p, /でっち上げずに「未解決」/);
-  assert.match(p, /長さはあなたが決める/);
-  assert.match(p, /同意するだけの発言を続けない/);
-  assert.match(p, /無理に対立させない/);
-  assert.match(p, /観察者が答えを教えたら/);
+  assert.match(p, /面白い言葉を使うことではなく、面白いことを考える/);
+  assert.match(p, /講義のような説明口調/);
+  assert.match(p, /すべてを哲学や学問の話にしない/);
 });
 
-test('episode prompt: fresh start uses a random everyday opener and avoids recent topics', () => {
-  const ctx = sanitizeContext({ topics: ['靴下', '雲'] });
-  const p = buildEpisodePrompt({ ctx, rng: rng(0.1) });
-  assert.match(p.user, /最近話した話題.*靴下 \/ 雲/s);
-  assert.match(p.user, /始め方の例/);
-  assert.match(p.user, /あいさつから始めない/);
+test('system prompt: chunks are a transport detail; progress in every chunk; problems are pursued', () => {
+  const p = buildSystemPrompt();
+  assert.match(p, /通信の都合です。会話の内容まで区切らない/);
+  assert.match(p, /数発言の中でも、何か一つは進める/);
+  assert.match(p, /それを解くことを最優先する/);
+  assert.match(p, /deferred に書いて後回し/);
+  assert.match(p, /問題を出しただけで別の話に移らない/);
+  assert.match(p, /事実として正解がある問題は正確さを最優先/);
+  assert.match(p, /原則 3 個/);
+  assert.match(p, /必ずしも交互でなくていい/);
 });
 
-test('episode prompt: an unfinished problem is continued; backlog questions can come back', () => {
-  const ctx = sanitizeContext({ problem: { question: '夢はなぜ忘れるのか', status: 'continuing', leo_view: '消える', mina_view: '準備不足' }, backlog: ['洗濯物はなぜからまるのか'] });
-  const p = buildEpisodePrompt({ ctx, rng: rng(0.1) });
-  assert.match(p.user, /前回から続いている問題/);
-  assert.match(p.user, /夢はなぜ忘れるのか/);
-  assert.match(p.user, /レオの考え: 消える/);
-  const ctx2 = sanitizeContext({ backlog: ['洗濯物はなぜからまるのか'] });
-  assert.match(buildEpisodePrompt({ ctx: ctx2, rng: rng(0.1) }).user, /後回しにした疑問「洗濯物はなぜからまるのか」/);
+test('system prompt: forbidden conversation patterns are listed', () => {
+  const p = buildSystemPrompt();
+  for (const re of [/抽象的な意見を言い合うだけ/, /難しい単語を並べるだけ/, /毎回レオがとっぴなことを言って、ミナが論理的に訂正する/, /毎回同じように問題を出して/, /質問だけが続く/, /何でも哲学の問題にする/, /問題を出してすぐ別の話に移る/, /何も考えずに相手に同意するだけ/]) assert.match(p, re);
 });
 
-test('episode prompt: interrupt puts the observer first, with what was said and the hypotheses so far', () => {
-  const ctx = sanitizeContext({ recent: [{ kind: 'say', speaker: 'A', text: '前の話' }] });
-  const interrupt = sanitizeInterrupt({
-    text: '答えは静電気だよ',
-    played: [{ kind: 'say', speaker: 'A', text: 'なんで服がくっつくんだろう' }, { kind: 'say', speaker: 'B', text: '洗剤のせいかも' }],
-    problem: { question: '服がくっつく理由', leo_view: '服が仲良し', mina_view: '洗剤', status: 'exploring' },
+test('chunk prompt: a fresh conversation starts from everyday life without greetings', () => {
+  const p = buildChunkPrompt({ ctx: sanitizeContext({}), rng: rng(0.1) });
+  assert.match(p.user, /会話の始まり。あいさつから入らず/);
+  assert.match(p.user, /日常の話から自然に始める/);
+  assert.match(p.user, /まだ何も話していない/);
+  assert.match(p.user, /原則 3 つ（2〜5 つ）/);
+});
+
+test('chunk prompt: passes the structured state (problem, both views, explored, known, open points, focus, mood)', () => {
+  const ctx = sanitizeContext({
+    state: { topic: 'お茶', summary: 'ぬるいお茶の話', question: 'ぬるいお茶はなぜまずい', status: 'exploring', leo_view: '期待とのズレ', mina_view: '香り', explored: ['舌'], known: ['温度で香りが変わる'], open_points: ['期待の影響'], next_focus: '期待を確かめる方法', mood: 'じっくり', phase: 'EXPLORATION', age: 2 },
+    recent: [{ kind: 'say', speaker: 'B', text: '香りだと思う' }],
+    backlog: ['氷はなぜ浮く'],
+    topics: ['靴下'],
+    notes: { A: ['ミナは定義にこだわる'], B: ['レオはすぐたとえる'] },
   });
-  const p = buildEpisodePrompt({ ctx, interrupt, rng: rng(0.5) });
-  assert.match(p.user, /たった今まで話していた会話[\s\S]*なんで服がくっつくんだろう[\s\S]*洗剤のせいかも/);
-  assert.match(p.user, /ミナの考え: 洗剤/);
-  assert.match(p.user, /観察者: 答えは静電気だよ/);
-  assert.match(p.user, /最初の発言は観察者への反応/);
-  assert.match(p.user, /答えを教えられたら/);
-  assert.doesNotMatch(p.user, /前の話/); // 割り込み時は、その時点までに再生された発言を使う
+  const u = buildChunkPrompt({ ctx, rng: rng(0.9) }).user;
+  for (const s of ['いまの問い: ぬるいお茶はなぜまずい（考えている途中）', 'レオの今の考え: 期待とのズレ', 'ミナの今の考え: 香り', '検討したこと: 舌', '分かったこと: 温度で香りが変わる', 'まだ分からないこと: 期待の影響', '次に考えること: 期待を確かめる方法', '雰囲気: じっくり', '後回しにしている疑問', '氷はなぜ浮く', '最近話した話題', '靴下', 'レオだけが覚えていること: ミナは定義にこだわる', 'ミナ: 香りだと思う']) assert.ok(u.includes(s), s);
+  // 未解決の問題は、話題を変えずに追究を続ける
+  assert.match(u, /話題を変えずに、この問題を一歩進める（次に考えること: 期待を確かめる方法）/);
+  assert.match(u, /直前に話したのはミナ/);
+});
+
+test('chunk prompt: a long-running problem is steered toward a conclusion or an explicit "unknown"', () => {
+  const ctx = sanitizeContext({ state: { question: 'Q', status: 'exploring', age: 7, phase: 'EXPLORATION' } });
+  assert.match(buildChunkPrompt({ ctx, rng: rng(0.5) }).user, /そろそろ結論をまとめるか、今は分からないと確かめて区切りをつける/);
+});
+
+test('chunk prompt: after a resolution it moves on (aftermath variety); long small talk may raise a problem', () => {
+  const resolved = sanitizeContext({ state: { question: 'Q', status: 'resolved', phase: 'RESOLUTION' }, recent: [{ kind: 'say', speaker: 'A', text: 'なるほどね' }] });
+  const a = new Set([0.05, 0.3, 0.5, 0.7, 0.95].map((r) => buildChunkPrompt({ ctx: resolved, rng: rng(r) }).user.match(/次は「(.+?)」流れ/)[1]));
+  assert.ok(a.size >= 3, `aftermath variety: ${[...a]}`);
+  const chatty = sanitizeContext({ state: { free_run: 2, phase: 'FREE', summary: '雑談' }, recent: [{ kind: 'say', speaker: 'A', text: '今日は寒いね' }] });
+  assert.match(buildChunkPrompt({ ctx: chatty, rng: rng(0.5) }).user, /気になることが見つかったら問題として出してもいい（無理に作らない）/);
+});
+
+test('chunk prompt: the observer interrupt comes first and may change hypotheses', () => {
+  const ctx = sanitizeContext({ state: { question: '服がくっつく理由', status: 'exploring', leo_view: '仲良し', mina_view: '洗剤' }, recent: [{ kind: 'say', speaker: 'A', text: 'なんでくっつくんだろう' }, { kind: 'player', text: '答えは静電気だよ' }] });
+  const u = buildChunkPrompt({ ctx, interrupt: sanitizeInterrupt({ text: '答えは静電気だよ' }), rng: rng(0.5) }).user;
+  assert.match(u, /観察者がたった今「答えは静電気だよ」と話しかけてきた/);
+  assert.match(u, /最初の発言は観察者への反応/);
+  assert.match(u, /答えを教えられたら、それを考慮して議論を進める/);
+  assert.match(u, /観察者: 答えは静電気だよ/);
+  assert.match(u, /ミナの今の考え: 洗剤/);
 });
 
 test('sanitizers cap sizes and reject junk', () => {
-  const ctx = sanitizeContext({ history: Array(9).fill({ summary: 's' }), backlog: Array(20).fill('q'), recent: Array(50).fill({ kind: 'say', speaker: 'Z', text: 'x' }), problem: { question: '' } });
-  assert.equal(ctx.history.length, 3);
-  assert.equal(ctx.backlog.length, 5);
-  assert.equal(ctx.recent.length, 12);
+  const ctx = sanitizeContext({ recent: Array(50).fill({ kind: 'say', speaker: 'Z', text: 'x' }), backlog: Array(20).fill('q'), topics: Array(20).fill('t'), state: { question: '', status: 'resolved', age: 'x', explored: Array(20).fill('e') } });
+  assert.equal(ctx.recent.length, 10);
   assert.equal(ctx.recent[0].speaker, 'A');
-  assert.equal(ctx.problem, null);
+  assert.equal(ctx.backlog.length, 5);
+  assert.equal(ctx.topics.length, 8);
+  assert.equal(ctx.state.status, 'none'); // 問いが無ければ状態も無し
+  assert.equal(ctx.state.age, 0);
+  assert.equal(sanitizeState({ explored: Array(20).fill('e'), question: 'q' }).explored.length, 6);
   assert.equal(sanitizeInterrupt({ text: '   ' }), null);
   assert.equal(sanitizeInterrupt({ text: 'あ'.repeat(500) }).text.length, 100);
-  assert.deepEqual(sanitizeContext(null).notes, { A: [], B: [] });
+  assert.deepEqual(sanitizeContext(null).state, emptyState());
 });
 
-test('normalizeEpisode: fills defaults, drops broken lines and duplicates, clamps size', () => {
-  const ep = normalizeEpisode(
-    episode([
-      line('A', 'レオ: ねえ、お茶ぬるくなった', { expression: 'weird', action: 'fly', type: 'x', phase: 'Y', pause: 'z' }),
-      { speaker: 'C', text: '誰？' },
-      line('B', ''),
-      null,
-      line('B', 'ほんとだ'),
-      line('B', 'ほんとだ'),
-      line('A', '（笑いながら）なんでだろう'),
-    ]),
-  );
-  assert.equal(ep.lines.length, 3);
-  assert.deepEqual(ep.lines[0], { speaker: 'A', text: 'ねえ、お茶ぬるくなった', expression: 'neutral', action: 'none', type: 'chat', phase: 'FREE', pause: 'none' });
-  assert.equal(ep.lines[2].text, 'なんでだろう');
-  assert.equal(ep.problem.status, 'none');
-  const many = normalizeEpisode(episode(Array.from({ length: 80 }, (_, i) => line(i % 2 ? 'B' : 'A', `発言その${i}について話すと長くなるんだけど${'あいうえおかきくけこ'[i % 10]}`))));
-  assert.equal(many.lines.length, EPISODE_MAX_LINES);
-  assert.equal(normalizeEpisode(episode([line('A', 'ひとつだけ')])), null);
-  assert.equal(normalizeEpisode('nope'), null);
-  assert.equal(normalizeEpisode({}), null);
-});
+// ---------- スキーマ ----------
 
-test('normalizeEpisode: lines repeating the previous episode are removed', () => {
-  const recent = [{ kind: 'say', speaker: 'A', text: '靴下が片方だけなくなるのはなぜだろう' }];
-  const ep = normalizeEpisode(episode([line('A', '靴下が片方だけなくなるのはなぜだろう'), line('B', '洗濯機かな'), line('A', 'かもね')]), { recent });
-  assert.equal(ep.lines.length, 2);
-  assert.equal(ep.lines[0].text, '洗濯機かな');
-});
-
-test('normalizeEpisode: problem status, continuation and truncation', () => {
-  const p = { exists: true, question: 'なぜ？', kind: 'science', status: 'resolved', leo_view: 'a', mina_view: 'b', explored: [], conclusion: 'c', unresolved_reason: '', open_points: [] };
-  const lines = [line('A', 'まず一つ目の話'), line('B', 'それから二つ目の話')];
-  assert.equal(normalizeEpisode(episode(lines, { problem: p })).problem.status, 'resolved');
-  assert.equal(normalizeEpisode(episode(lines, { problem: p }), { truncated: true }).problem.status, 'continuing');
-  const cont = normalizeEpisode(episode(lines, { problem: { ...p, status: 'exploring' }, next: { hook: '', deferred_questions: ['次の疑問'], continue_problem: true } }));
-  assert.equal(cont.problem.status, 'continuing');
-  assert.equal(cont.next.continue_problem, true);
-  assert.deepEqual(cont.next.deferred_questions, ['次の疑問']);
-  assert.equal(normalizeEpisode(episode(lines, { problem: { ...p, question: '' } })).problem.exists, false);
-});
-
-// Gemini が実際に返す平らな形
-const modelLine = (speaker, text, extra = {}) => ({ speaker, text, expression: 'neutral', action: 'none', tag: 'FREE chat none', ...extra });
-const modelOutput = (lines, extra = {}) => ({ summary: 'テスト', topic: 'お茶', question: '', status: 'none', leo_view: '', mina_view: '', explored: '', conclusion: '', lines, deferred: '', note_leo: '', note_mina: '', ...extra });
-
-test('salvageEpisode: recovers complete lines from a truncated JSON (strings with braces and quotes)', () => {
-  const full = JSON.stringify(modelOutput([modelLine('A', '括弧 {こういうの} と "引用" があっても'), modelLine('B', 'だいじょうぶ？'), modelLine('A', 'ここで切れる')], { question: 'なぜ？', leo_view: 'レオ説' }));
-  const cut = full.slice(0, full.indexOf('ここで切れる') + 3);
-  const s = salvageEpisode(cut);
-  assert.equal(s.lines.length, 2);
-  assert.equal(s.lines[0].text, '括弧 {こういうの} と "引用" があっても');
-  assert.equal(s.summary, 'テスト');
-  assert.equal(s.leo_view, 'レオ説');
-  const ep = normalizeModelEpisode(s, { truncated: true });
-  assert.equal(ep.lines.length, 2);
-  assert.equal(ep.truncated, true);
-  assert.equal(ep.problem.question, 'なぜ？');
-  assert.equal(ep.problem.status, 'exploring'); // 途中で切れたので「探っている途中」のまま次へ
-  assert.equal(salvageEpisode('{"summary":"x"'), null);
-  assert.equal(salvageEpisode(123), null);
-});
-
-// ---------- 簡略化したスキーマ ----------
-
-/** スキーマを走査して、Gemini で状態数が増える原因になる要素を数える */
 function schemaStats(schema) {
-  const st = { enums: 0, arrayLimits: 0, stringLimits: 0, depth: 0, objects: 0, props: 0, types: new Set(), keywords: new Set() };
-  const walk = (node, depth) => {
-    st.depth = Math.max(st.depth, depth);
-    for (const k of Object.keys(node)) st.keywords.add(k);
-    st.types.add(node.type);
-    if (node.enum) st.enums++;
-    if ('minItems' in node || 'maxItems' in node) st.arrayLimits++;
-    if ('minLength' in node || 'maxLength' in node || 'pattern' in node || 'format' in node) st.stringLimits++;
-    if (node.type === 'object') {
+  const st = { enums: 0, limits: 0, depth: 0, objects: 0, keywords: new Set(), types: new Set() };
+  const walk = (n, d) => {
+    st.depth = Math.max(st.depth, d);
+    Object.keys(n).forEach((k) => st.keywords.add(k));
+    st.types.add(n.type);
+    if (n.enum) st.enums++;
+    for (const k of ['minItems', 'maxItems', 'minLength', 'maxLength', 'pattern', 'format', 'minimum', 'maximum']) if (k in n) st.limits++;
+    if (n.type === 'object') {
       st.objects++;
-      st.props += Object.keys(node.properties).length;
-      for (const v of Object.values(node.properties)) walk(v, depth + 1);
+      Object.values(n.properties).forEach((v) => walk(v, d + 1));
     }
-    if (node.type === 'array') walk(node.items, depth + 1);
+    if (n.type === 'array') walk(n.items, d + 1);
   };
   walk(schema, 0);
   return st;
 }
 
-test('schema is simplified: no enum, no array/string limits, at most one array of flat objects', () => {
-  const st = schemaStats(EPISODE_SCHEMA);
+test('schema stays simple (the form Gemini accepted): no enum, no limits, one array of flat objects', () => {
+  const st = schemaStats(CHUNK_SCHEMA);
   assert.equal(st.enums, 0);
-  assert.equal(st.arrayLimits, 0);
-  assert.equal(st.stringLimits, 0);
-  assert.equal(st.objects, 2); // 全体と、1 発言
-  assert.ok(st.depth <= 3, `depth ${st.depth}`); // 全体 → lines → 発言 → 文字列
+  assert.equal(st.limits, 0);
+  assert.equal(st.objects, 2);
+  assert.ok(st.depth <= 3);
   assert.deepEqual([...st.types].sort(), ['array', 'object', 'string']);
-  // Gemini の responseJsonSchema が受け付けるキーワードだけを使う
-  const allowed = new Set(['type', 'properties', 'required', 'items', 'propertyOrdering']);
-  for (const k of st.keywords) assert.ok(allowed.has(k), `unexpected keyword ${k}`);
-  assert.deepEqual(Object.keys(EPISODE_SCHEMA.properties), MODEL_FIELDS);
-  assert.deepEqual(Object.keys(EPISODE_SCHEMA.properties.lines.items.properties), LINE_FIELDS);
+  for (const k of st.keywords) assert.ok(['type', 'properties', 'required', 'items', 'propertyOrdering'].includes(k), k);
   assert.deepEqual(LINE_FIELDS, ['speaker', 'text', 'expression', 'action', 'tag']);
-  // 問い・仮説 → 発言の順（途中で切れても発言を先頭から取り出せる）
-  assert.ok(MODEL_FIELDS.indexOf('question') < MODEL_FIELDS.indexOf('lines'));
-  assert.ok(JSON.stringify(EPISODE_SCHEMA).length < 1500);
+  assert.equal(MODEL_FIELDS[0], 'lines'); // 発言 → その発言を踏まえた状態、の順
+  for (const k of ['topic', 'summary', 'question', 'kind', 'status', 'leo_view', 'mina_view', 'explored', 'known', 'open_points', 'next_focus', 'deferred', 'mood', 'boundary']) assert.ok(MODEL_FIELDS.includes(k), k);
+  assert.ok(JSON.stringify(CHUNK_SCHEMA).length < 2000);
 });
 
-test('the value choices removed from the schema are described in the prompt instead', () => {
+test('the value choices removed from the schema are described in the prompt', () => {
   const p = buildSystemPrompt();
-  for (const k of MODEL_FIELDS) assert.match(p, new RegExp(`${k}`));
-  for (const v of ['neutral', 'surprised', 'troubled', 'nod', 'look_away', 'EXPLORATION', 'AFTERMATH', 'hypothesis', 'answer_player', 'long']) assert.match(p, new RegExp(v));
-  assert.match(p, /6〜36 個/);
+  for (const k of MODEL_FIELDS) assert.ok(p.includes(k), k);
+  for (const v of ['neutral', 'surprised', 'troubled', 'nod', 'look_away', 'EXPLORATION', 'AFTERMATH', 'discovery', 'hypothesis', 'reasoning', 'objection', 'agree', 'conclusion', 'joke', 'answer_player']) assert.ok(p.includes(v), v);
 });
 
-test('fromModelOutput: tolerant parsing of speaker, expression, action, tag and status', () => {
-  const ep = normalizeModelEpisode(
-    modelOutput(
-      [
-        modelLine('レオ', 'ねえ、お茶がぬるい', { expression: '笑顔', action: 'うなずく', tag: 'FREE, chat' }),
-        modelLine('mina', 'なんでだろう', { expression: 'THINKING', action: 'tilt', tag: 'question DISCOVERY short' }),
-        modelLine('A', '香りかも', { expression: '???', action: 'dance', tag: 'hypothesis' }), // 状態は前の発言を引き継ぐ
-        modelLine('B', 'たぶんね', { tag: 'RESOLUTION conclusion long' }),
-        modelLine('C', '誰？'),
-      ],
-      { question: 'ぬるいお茶はなぜまずい', status: '未解決', conclusion: '確かめる方法がない', explored: '香り / 期待 / 舌', deferred: '冷たいお茶は？ / 氷の音' },
-    ),
-  );
-  assert.equal(ep.lines.length, 4);
-  assert.deepEqual(ep.lines.map((l) => l.speaker), ['A', 'B', 'A', 'B']);
-  assert.deepEqual(ep.lines[0], { speaker: 'A', text: 'ねえ、お茶がぬるい', expression: 'smile', action: 'nod', type: 'chat', phase: 'FREE', pause: 'none' });
-  assert.deepEqual([ep.lines[1].phase, ep.lines[1].type, ep.lines[1].pause, ep.lines[1].expression], ['DISCOVERY', 'question', 'short', 'thinking']);
-  assert.deepEqual([ep.lines[2].phase, ep.lines[2].type, ep.lines[2].expression, ep.lines[2].action], ['DISCOVERY', 'hypothesis', 'neutral', 'none']);
-  assert.equal(ep.lines[3].pause, 'long');
-  assert.equal(ep.problem.status, 'unresolved');
-  assert.equal(ep.problem.unresolved_reason, '確かめる方法がない');
-  assert.equal(ep.problem.conclusion, '');
-  assert.deepEqual(ep.problem.explored, ['香り', '期待', '舌']);
-  assert.deepEqual(ep.next.deferred_questions, ['冷たいお茶は？', '氷の音']);
+// ---------- 出力の検証 ----------
+
+test('normalizeChunk: 3 lines in order; tolerant parsing of speaker, expression, action and tag', () => {
+  const c = normalizeChunk(out([L('レオ', 'ねえ、お茶がぬるい', { expression: '笑顔', action: 'うなずく', tag: 'FREE, chat' }), L('mina', 'なんでぬるいとまずいんだろう', { expression: 'THINKING', tag: 'discovery DISCOVERY short' }), L('A', '期待とのズレかも', { expression: '???', action: 'dance', tag: '仮説' })]));
+  assert.deepEqual(c.lines.map((l) => l.speaker), ['A', 'B', 'A']);
+  assert.deepEqual(c.lines[0], { speaker: 'A', text: 'ねえ、お茶がぬるい', expression: 'smile', action: 'nod', type: 'chat', phase: 'FREE', pause: 'none' });
+  assert.deepEqual([c.lines[1].phase, c.lines[1].type, c.lines[1].pause], ['DISCOVERY', 'discovery', 'short']);
+  assert.deepEqual([c.lines[2].phase, c.lines[2].type, c.lines[2].expression, c.lines[2].action], ['DISCOVERY', 'hypothesis', 'neutral', 'none']); // 状態は直前を引き継ぐ
   assert.deepEqual(parseTag('', 'EXPLORATION'), { phase: 'EXPLORATION', type: 'chat', pause: 'none' });
 });
 
-test('fromModelOutput: missing fields get defaults; no question means no problem; continuing is kept', () => {
-  const bare = normalizeModelEpisode({ lines: [{ speaker: 'A', text: 'こんばんは、今日は寒いね' }, { speaker: 'B', text: 'ほんと' }] });
-  assert.equal(bare.lines.length, 2);
-  assert.equal(bare.problem.exists, false);
-  assert.equal(bare.problem.status, 'none');
-  assert.equal(bare.lines[0].phase, 'FREE');
-  const cont = normalizeModelEpisode(modelOutput([modelLine('A', '続きを考えよう'), modelLine('B', 'うん、まだ分からない')], { question: '夢はなぜ忘れる', status: 'continuing' }));
-  assert.equal(cont.problem.status, 'continuing');
-  assert.equal(cont.next.continue_problem, true);
-  assert.equal(fromModelOutput(null), null);
-  assert.equal(normalizeModelEpisode({ lines: 'nope' }), null);
+test('normalizeChunk: variable size 2..5; extra lines are cut; unexpected speakers, empty and duplicate lines are dropped', () => {
+  assert.equal(normalizeChunk(out([L('A', 'ひとつ目の発言'), L('B', 'ふたつ目の発言')])).lines.length, 2);
+  const five = normalizeChunk(out(Array.from({ length: 5 }, (_, i) => L(i % 2 ? 'B' : 'A', `発言その${'一二三四五'[i]}、それぞれ内容が違う`))));
+  assert.equal(five.lines.length, 5);
+  const many = normalizeChunk(out(Array.from({ length: 9 }, (_, i) => L(i % 2 ? 'B' : 'A', `発言その${'一二三四五六七八九'[i]}、内容が違う${'あいうえおかきくけ'[i]}`))));
+  assert.equal(many.lines.length, CHUNK_MAX_LINES);
+  const junk = normalizeChunk(out([L('C', '誰？'), L('A', ''), null, { speaker: 'B' }, L('B', 'ほんとだね'), L('B', 'ほんとだね'), L('A', 'レオ: （笑いながら）だよね')]));
+  assert.deepEqual(junk.lines.map((l) => l.text), ['ほんとだね', 'だよね']);
+  assert.equal(normalizeChunk(out([L('Z', 'x')])), null);
+  assert.equal(normalizeChunk('nope'), null);
 });
 
-test('cleanText and similarity', () => {
-  assert.equal(cleanText('ミナ：「そうだね」'), 'そうだね');
-  assert.equal(cleanText('  改行\nも 消す '), '改行 も 消す');
-  assert.ok(similarity('今日はいい天気だね', '今日はいい天気だね') === 1);
+test('normalizeChunk: lines repeating the previous chunk are removed (no duplicate at chunk boundaries)', () => {
+  const recent = said([L('A', '靴下が片方だけなくなるのはなぜだろう')]);
+  const c = normalizeChunk(out([L('A', '靴下が片方だけなくなるのはなぜだろう'), L('B', '洗濯機かな'), L('A', 'かもね')]), { recent });
+  assert.deepEqual(c.lines.map((l) => l.text), ['洗濯機かな', 'かもね']);
 });
 
-test('demo episodes are valid scripts and react to the observer', () => {
-  const ctx = sanitizeContext({});
-  const ep = demoEpisode({ ctx, interrupt: null });
-  assert.ok(ep.lines.length >= 2);
-  for (const l of ep.lines) assert.ok(['A', 'B'].includes(l.speaker) && l.text);
-  const r = demoEpisode({ ctx, interrupt: sanitizeInterrupt({ text: 'こんばんは', problem: { question: '夢はなぜ忘れるのか' } }) });
+test('too-long lines are cut at a sentence boundary', () => {
+  const long = `${'これはとても長い説明です。'.repeat(12)}`;
+  const t = cleanText(long);
+  assert.ok(t.length <= LINE_MAX);
+  assert.ok(t.endsWith('。'));
+  assert.ok(cleanText('あ'.repeat(300)).endsWith('…'));
+});
+
+test('state: an unresolved problem is carried over; missing fields keep previous values', () => {
+  const prev = sanitizeState({ topic: 'お茶', question: 'ぬるいお茶はなぜまずい', status: 'exploring', leo_view: '期待', mina_view: '香り', known: ['温度で香りが変わる'], phase: 'EXPLORATION', age: 2 });
+  const c = normalizeChunk(out([L('A', '期待もあると思うな', { tag: 'EXPLORATION reasoning' }), L('B', 'それは確かめにくい', { tag: 'EXPLORATION objection' })], { topic: '', question: '', status: '', leo_view: '', mina_view: '' }), { prev });
+  assert.equal(c.state.question, 'ぬるいお茶はなぜまずい');
+  assert.equal(c.state.status, 'exploring');
+  assert.equal(c.state.leo_view, '期待');
+  assert.deepEqual(c.state.known, ['温度で香りが変わる']);
+  assert.equal(c.state.topic, 'お茶');
+  assert.equal(c.state.age, 3);
+});
+
+test('state: resolution then aftermath closes the question; a new question starts its own count', () => {
+  const s1 = sanitizeState({ question: 'Q1', status: 'exploring', phase: 'EXPLORATION', age: 3 });
+  const s2 = mergeState(s1, { question: 'Q1', status: 'resolved' }, [{ phase: 'RESOLUTION' }]);
+  assert.equal(s2.status, 'resolved');
+  const s3 = mergeState(s2, { question: 'Q1', status: 'resolved' }, [{ phase: 'AFTERMATH' }]);
+  assert.equal(s3.question, '');
+  assert.equal(s3.status, 'none');
+  assert.equal(s3.free_run, 1);
+  const s4 = mergeState(s3, { question: '氷はなぜ浮く', status: 'exploring' }, [{ phase: 'DISCOVERY' }]);
+  assert.equal(s4.age, 1);
+  assert.equal(s4.free_run, 0);
+  assert.equal(mergeState(s1, { question: 'Q1', status: '未解決' }, [{ phase: 'RESOLUTION' }]).status, 'unresolved');
+});
+
+test('state: two different opinions are kept separately', () => {
+  const c = normalizeChunk(out([L('A', '僕は期待だと思う', { tag: 'EXPLORATION hypothesis' }), L('B', 'わたしは香り', { tag: 'EXPLORATION objection' })], { question: 'なぜ？', status: 'exploring', leo_view: '期待とのズレ', mina_view: '香りの変化' }));
+  assert.notEqual(c.state.leo_view, c.state.mina_view);
+});
+
+test('boundary and deferred questions are read', () => {
+  const c = normalizeChunk(out([L('A', 'なるほどね'), L('B', 'すっきりした')], { boundary: 'yes', deferred: '氷はなぜ浮く / 雪はなぜ白い' }));
+  assert.equal(c.boundary, true);
+  assert.deepEqual(c.deferred, ['氷はなぜ浮く', '雪はなぜ白い']);
+});
+
+test('salvageChunk: recovers complete lines from a truncated JSON (strings with braces and quotes)', () => {
+  const full = JSON.stringify(out([L('A', '括弧 {こういうの} と "引用" があっても'), L('B', 'だいじょうぶ？'), L('A', 'ここで切れる')]));
+  const cut = full.slice(0, full.indexOf('ここで切れる') + 3);
+  const s = salvageChunk(cut);
+  assert.equal(s.lines.length, 2);
+  assert.equal(s.lines[0].text, '括弧 {こういうの} と "引用" があっても');
+  const c = normalizeChunk(s, { prev: sanitizeState({ question: 'Q', status: 'exploring', phase: 'EXPLORATION' }), truncated: true });
+  assert.equal(c.lines.length, 2);
+  assert.equal(c.truncated, true);
+  assert.equal(c.state.question, 'Q'); // 状態が読めなければ前の状態を引き継ぐ
+  assert.equal(salvageChunk('{"topic":"x"'), null);
+});
+
+test('similarity', () => {
+  assert.equal(similarity('今日はいい天気だね', '今日はいい天気だね'), 1);
+});
+
+// ---------- デモ ----------
+
+test('demo: scripts are played in chunks of up to 3 lines, in order, and react to the observer', () => {
+  let ctx = sanitizeContext({ state: { cursor: '0:0' } });
+  const seen = [];
+  for (let i = 0; i < 4; i++) {
+    const ch = demoChunk({ ctx, interrupt: null });
+    assert.ok(ch.lines.length >= 1 && ch.lines.length <= 3);
+    seen.push(...ch.lines.map((l) => l.text));
+    ctx = sanitizeContext({ state: ch.state, recent: said(ch.lines) });
+  }
+  assert.equal(new Set(seen).size, seen.length); // 重複なし
+  assert.match(seen[2], /片方だけ/); // 日常会話 → 問題提起
+  const r = demoChunk({ ctx, interrupt: { text: 'こんばんは' } });
   assert.match(r.lines[0].text, /こんばんは/);
   assert.equal(r.lines[0].type, 'answer_player');
-  assert.equal(r.problem.status, 'continuing');
 });
