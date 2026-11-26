@@ -104,7 +104,23 @@ API キーがなくても、デモモード（後述）で画面の動きは確�
 | `IP_RPM_LIMIT` | `8` | 接続元ごとの 1 分あたり上限（会話のテンポもこの値で決まる。1 人あたり 1 分に約 7 発言） |
 | `IP_MIN_INTERVAL_MS` | `2500` | 接続元ごとの最小リクエスト間隔 |
 | `MAX_CONCURRENT` | `3` | 同時に処理する AI リクエスト数 |
+| `GEMINI_TIMEOUT_MS` | `30000` | Gemini への 1 回の呼び出しの制限時間 |
+| `UPSTREAM_COOLDOWN_BASE_MS` | `4000` | Gemini が 503 などを返したあと、サーバー全体で呼び出しを控える時間の初期値 |
+| `UPSTREAM_COOLDOWN_MAX_MS` | `60000` | 上の待ち時間の上限（失敗が続くと倍々に伸び、成功すると元に戻る） |
 | `PORT` / `HOST` | `3000` / `127.0.0.1`（Render では `0.0.0.0`） | 待ち受けポートとアドレス |
+
+## Gemini が不安定なとき（503 など）
+
+Gemini API は混雑時に **HTTP 503（`UNAVAILABLE`, "The model is overloaded"）** を返すことがあります。これは Google 側の一時的な過負荷で、こちらの使いすぎ（その場合は 429）とは別のものです。このアプリは次のように扱います。
+
+- **サーバー**：Gemini の HTTP ステータス・エラーコード・メッセージ・所要時間をログに 1 行で残します（プロンプトや API キーは出しません）。
+  ```
+  [gemini] error model=gemini-3.5-flash-lite ms=412 http=503 code=UNAVAILABLE message="The model is overloaded. Please try again later." mapped=upstream_unavailable
+  [gemini] cooldown 4900ms after upstream_unavailable (consecutive failures: 1)
+  ```
+  503 / 500 / 502 / 504・分間上限の 429・タイムアウトのあとは、**サーバー全体で少しの間 Gemini を呼ばず**、ブラウザには理由と待ち時間（`Retry-After`）をすぐ返します。待ち時間は失敗が続くほど伸び（上限 60 秒）、成功すると元に戻ります。混雑中に全員が呼び続けて悪化させず、無料枠も使いません。Gemini が不安定な間は、重複したセリフの作り直しもしません。
+- **ブラウザ**：「Google の AI（Gemini）が一時的に応答できません（HTTP 503 UNAVAILABLE）。○秒ほど待ってから続けます…」と表示し、ヘッダーは「応答待ち」（意図的な沈黙の「静かな間」とは別）になります。待ち時間はサーバーの指示以上、かつ 6 → 15 → 30 → 45 秒と伸ばします。**5 回続けて失敗したら会話を止め**、理由を表示します（▶ で再開できます）。無限にはやり直しません。
+- **どこが返したエラーか**：ログの `[gemini]` 行は Gemini の応答です。ブラウザの表示が「ゲームのサーバーが応答していません（HTTP 503）。起動中かもしれません」のときは、アプリより手前の Render（休止からの起動中・再デプロイ中など）が返したものです。
 
 ## デモモード
 

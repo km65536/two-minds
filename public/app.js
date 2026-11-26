@@ -81,7 +81,7 @@ function clearSession() {
 // ---------------- 表示 ----------------
 
 function setStatus(state) {
-  const labels = { idle: '待機中', running: '会話中', quiet: '静かな間', paused: '一時停止中', error: '停止中' };
+  const labels = { idle: '待機中', running: '会話中', quiet: '静かな間', waiting: '応答待ち', paused: '一時停止中', error: '停止中' };
   el.status.dataset.state = state;
   el.statusText.textContent = labels[state];
   el.playBtn.classList.toggle('paused', !running);
@@ -254,10 +254,13 @@ function showOverlay({ title, text, note = '', button, alt = '', action }) {
 // ---------------- API ----------------
 
 class ApiError extends Error {
-  constructor(code, message, retryable) {
+  constructor(code, message, retryable, { source = 'server', retryAfterMs = 0, httpStatus = 0 } = {}) {
     super(message);
     this.code = code;
     this.retryable = retryable;
+    this.source = source; // 'gemini' | 'server' | 'host'（Render などの手前の層）| 'network'
+    this.retryAfterMs = retryAfterMs;
+    this.httpStatus = httpStatus;
   }
 }
 
@@ -270,15 +273,21 @@ async function api(path, body) {
       body: body ? JSON.stringify(body) : undefined,
     });
   } catch {
-    throw new ApiError('offline', 'サーバーに接続できません。', true);
+    throw new ApiError('offline', 'サーバーに接続できません（ネットワークを確認してください）。', true, { source: 'network' });
   }
   let data = null;
   try {
     data = await res.json();
   } catch {}
   if (!res.ok) {
-    const e = data?.error || {};
-    throw new ApiError(e.code || `http_${res.status}`, e.message || `エラーが発生しました（${res.status}）`, !!e.retryable);
+    const e = data?.error;
+    if (e?.code) {
+      // このアプリのサーバーが返したエラー（Gemini 由来なら source が 'gemini'）
+      throw new ApiError(e.code, e.message, !!e.retryable, { source: e.source || 'server', retryAfterMs: e.retryAfterMs || 0, httpStatus: res.status });
+    }
+    // JSON でない応答 = アプリより手前（Render のプロキシなど）が返したもの。起動中・再起動中に起きる
+    const hostDown = [502, 503, 504].includes(res.status);
+    throw new ApiError(hostDown ? 'host_unavailable' : `http_${res.status}`, hostDown ? `ゲームのサーバーが応答していません（HTTP ${res.status}）。起動中かもしれません。` : `エラーが発生しました（HTTP ${res.status}）`, hostDown, { source: 'host', httpStatus: res.status });
   }
   return data;
 }
@@ -373,6 +382,10 @@ async function step({ once = false } = {}) {
     if ((res.calls || 1) > 1) notePace(res.calls - 1); // 作り直しの分も数える
     await waitVisible(); // 画面を離れている間に届いた発言は、戻ってから話す
     hideThinking();
+    if (waitNotice) {
+      clearWaitNotice();
+      if (running) setStatus('running');
+    }
     for (const e of S.recent) if (e.kind === 'player' && !e.answeredBy.includes(speaker)) e.answeredBy.push(speaker);
     remember({ kind: 'say', speaker, text: res.text, intent: res.intent, topic: res.topic, answeredBy: [] });
     rememberTurn(speaker, res);
@@ -381,6 +394,7 @@ async function step({ once = false } = {}) {
     await speak(speaker, res.text, res.expression);
     if (Math.random() < 0.45) nod(other(speaker));
     errors = 0;
+    transientErrors = 0;
     idleTurns++;
   } catch (err) {
     hideThinking();
@@ -465,14 +479,45 @@ function endSilence(natural) {
 }
 
 /** エラーを処理し、次の発言までの待ち時間を返す（続けない場合は null） */
-function handleError(err, speaker) {
-  errors++;
-  const code = err?.code;
-  if (code === 'upstream_busy') {
-    // Gemini 側の 1 分あたりの上限：少し長めに待ってやり直す。続くようならデモへ
-    if (errors < 3) return 20_000;
+// 一時的な障害（Gemini の過負荷・分間上限・タイムアウト、通信、サーバーの起動中）
+const TRANSIENT = ['upstream_unavailable', 'upstream_cooldown', 'upstream_busy', 'timeout', 'network', 'host_unavailable', 'offline'];
+const TRANSIENT_MAX = 5; // 続けて失敗したら止める回数（無限にはやり直さない）
+const TRANSIENT_BACKOFF = [6000, 15000, 30000, 45000];
+let transientErrors = 0;
+let waitNotice = null;
+
+function showWaitNotice(text) {
+  if (!waitNotice || !waitNotice.isConnected) {
+    waitNotice = document.createElement('div');
+    waitNotice.className = 'notice error';
+    addBubble(waitNotice);
   }
-  if (['daily_limit', 'upstream_quota', 'upstream_busy', 'no_key', 'disabled', 'auth', 'model'].includes(code)) {
+  waitNotice.textContent = text;
+  fitBubbles(waitNotice);
+}
+function clearWaitNotice() {
+  if (waitNotice) waitNotice.remove();
+  waitNotice = null;
+  markAges();
+}
+
+function handleError(err, speaker) {
+  const code = err?.code;
+  if (TRANSIENT.includes(code)) {
+    transientErrors++;
+    if (transientErrors >= TRANSIENT_MAX) {
+      transientErrors = 0;
+      clearWaitNotice();
+      return stopWithError({ message: `${err.message} 何度か待ってみましたが回復しませんでした。時間をおいて` });
+    }
+    const base = TRANSIENT_BACKOFF[Math.min(transientErrors - 1, TRANSIENT_BACKOFF.length - 1)];
+    const wait = Math.max(err.retryAfterMs || 0, base) + Math.round(Math.random() * 2000);
+    showWaitNotice(`${err.message} ${Math.ceil(wait / 1000)} 秒ほど待ってから続けます…（${transientErrors}/${TRANSIENT_MAX - 1}）`);
+    setStatus('waiting');
+    return wait;
+  }
+  errors++;
+  if (['daily_limit', 'upstream_quota', 'no_key', 'disabled', 'auth', 'model'].includes(code)) {
     // AI が使えないときは、はっきり区別したうえでデモモードに切り替えて続ける
     setMode('demo');
     notice(`${err.message} ここからはデモモード（AI ではありません）で続けます。`, 'demo');
@@ -485,8 +530,8 @@ function handleError(err, speaker) {
     return errors >= 3 ? stopWithError(err) : 2500;
   }
   if (code === 'too_fast' || code === 'busy') {
-    // 混雑：何も表示せず、少し待ってやり直す（上限 3 回）
-    return errors >= 4 ? stopWithError(err) : [3000, 6000, 10000][errors - 1] || 10000;
+    // このサーバーの上限による待ち（AI は呼んでいない）：少し待ってやり直す（上限 3 回）
+    return errors >= 4 ? stopWithError(err) : Math.max(err.retryAfterMs || 0, [3000, 6000, 10000][errors - 1] || 10000);
   }
   if (err?.retryable && errors < 3) {
     notice('通信がうまくいかなかったので、少し待ってやり直します…', 'error');
@@ -507,6 +552,7 @@ function play() {
   el.overlay.hidden = true;
   running = true;
   errors = 0;
+  transientErrors = 0;
   idleTurns = 0;
   if (!S.started) {
     S.started = true;

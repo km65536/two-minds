@@ -108,3 +108,58 @@ export class Limiter {
     };
   }
 }
+
+/**
+ * Gemini が過負荷（503 など）・分間上限（429）・タイムアウトを返したとき、サーバー全体で少し待つための仕組み。
+ * 待っている間は Gemini を呼ばずに、理由と待ち時間をすぐ返す（混雑中に全員が呼び続けて悪化させない・無料枠を使わない）。
+ * 待ち時間は失敗が続くほど伸び（上限あり）、成功すると元に戻る。
+ */
+export class UpstreamGate {
+  constructor({ baseMs = 4000, maxMs = 60_000 } = {}, clock = () => Date.now(), rng = Math.random) {
+    this.baseMs = baseMs;
+    this.maxMs = maxMs;
+    this.clock = clock;
+    this.rng = rng;
+    this.failures = 0;
+    this.until = 0;
+    this.lastReason = null;
+  }
+
+  /** 待機中なら、あと何ミリ秒待てばよいか（待機中でなければ 0） */
+  remaining() {
+    return Math.max(0, this.until - this.clock());
+  }
+
+  check() {
+    const ms = this.remaining();
+    if (ms > 0) {
+      throw new AIError('upstream_cooldown', `Google の AI（Gemini）が混み合っているため、少し待っています（直前の応答: ${this.lastReason}）。`, {
+        status: 503,
+        retryable: true,
+        source: 'gemini',
+        retryAfterMs: ms,
+      });
+    }
+  }
+
+  onSuccess() {
+    this.failures = 0;
+    this.until = 0;
+  }
+
+  /** 失敗を記録し、待ち時間（ミリ秒）を返す */
+  onFailure(reason, hintMs = 0) {
+    this.failures++;
+    const backoff = Math.min(this.maxMs, this.baseMs * 2 ** (this.failures - 1));
+    const jitter = backoff * 0.25 * this.rng();
+    const wait = Math.round(Math.min(this.maxMs, Math.max(hintMs, backoff + jitter)));
+    this.until = this.clock() + wait;
+    this.lastReason = reason;
+    return wait;
+  }
+}
+
+/** この種類のエラーなら、サーバー全体で少し待つ */
+export function isUpstreamTransient(err) {
+  return err?.source === 'gemini' && ['upstream_unavailable', 'upstream_busy', 'timeout'].includes(err.code);
+}

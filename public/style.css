@@ -71,6 +71,7 @@ button, input { font: inherit; color: inherit; }
 .status .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
 .status[data-state='running'] .dot { background: #93d3a2; animation: pulse 2s infinite; }
 .status[data-state='quiet'] .dot { background: #93a8d3; }
+.status[data-state='waiting'] .dot { background: var(--warn); animation: pulse 1.2s infinite; }
 .status[data-state='paused'] .dot { background: var(--warn); }
 .status[data-state='error'] .dot { background: var(--danger); }
 @keyframes pulse { 50% { opacity: 0.35; } }

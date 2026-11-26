@@ -32,12 +32,21 @@ async function startServer(env) {
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   servers.push(proc);
+  const url = `http://127.0.0.1:${port}`;
+  logs[url] = [];
+  proc.stderr.on('data', (d) => logs[url].push(String(d)));
   await new Promise((resolve, reject) => {
-    proc.stdout.on('data', (d) => String(d).includes('TWO MINDS') && resolve());
+    proc.stdout.on('data', (d) => {
+      logs[url].push(String(d));
+      if (String(d).includes('TWO MINDS')) resolve();
+    });
     proc.on('exit', (c) => reject(new Error(`server exited ${c}`)));
   });
-  return `http://127.0.0.1:${port}`;
+  return url;
 }
+const logs = {};
+const logText = (url) => logs[url].join('');
+const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
 let base;
 before(async () => {
@@ -47,12 +56,16 @@ before(async () => {
     req.on('end', () => {
       requests.push({ url: req.url, headers: req.headers, body: JSON.parse(body || '{}') });
       const next = queue.shift() || geminiOk(turn(`デフォルトの応答です${requests.length}`));
-      res.writeHead(next.status, { 'content-type': 'application/json' });
-      res.end(JSON.stringify(next.json));
+      setTimeout(() => {
+        if (res.destroyed) return;
+        res.writeHead(next.status, { 'content-type': 'application/json' });
+        res.end(JSON.stringify(next.json));
+      }, next.delay || 0);
     });
   });
   await new Promise((r) => mock.listen(0, '127.0.0.1', r));
-  base = await startServer({ GEMINI_API_KEY: 'test-key' });
+  // 共通のサーバーでは、障害後の待ち時間をほぼ 0 にしておく（待ち時間そのものは専用のテストで確かめる）
+  base = await startServer({ GEMINI_API_KEY: 'test-key', UPSTREAM_COOLDOWN_BASE_MS: '1', UPSTREAM_COOLDOWN_MAX_MS: '1' });
 });
 after(() => { for (const s of servers) s.kill(); mock?.close(); });
 
@@ -150,6 +163,108 @@ test('turn: Gemini 429 is not retried; daily vs per-minute quota are distinguish
   assert.equal(m.json.error.code, 'upstream_busy');
   assert.equal(m.json.error.retryable, true);
   assert.equal(requests.length, 2);
+  await wait(20);
+});
+
+// ---------- 503 などの一時的な障害 ----------
+
+const overloaded = (code = 503, status = 'UNAVAILABLE', message = 'The model is overloaded. Please try again later.') => geminiErr(code, status, message);
+
+test('503 from Gemini: reported as Gemini-side, logged with HTTP status / code / message, not retried', async () => {
+  const b = await startServer({ GEMINI_API_KEY: 'k', UPSTREAM_COOLDOWN_BASE_MS: '400', UPSTREAM_COOLDOWN_MAX_MS: '2000' });
+  requests.length = 0;
+  queue.push(overloaded());
+  const r = await fetch(b + '/api/turn', { method: 'POST', headers: H, body: JSON.stringify({ speaker: 'A', log: [] }) });
+  const j = await r.json();
+  assert.equal(r.status, 503);
+  assert.equal(j.error.code, 'upstream_unavailable');
+  assert.equal(j.error.source, 'gemini');
+  assert.equal(j.error.upstreamStatus, 503);
+  assert.equal(j.error.retryable, true);
+  assert.match(j.error.message, /Gemini.*HTTP 503 UNAVAILABLE/);
+  assert.ok(j.error.retryAfterMs >= 400);
+  assert.ok(Number(r.headers.get('retry-after')) >= 1);
+  assert.equal(requests.length, 1); // SDK もサーバーも勝手にやり直さない
+  await wait(50);
+  const log = logText(b);
+  assert.match(log, /\[gemini\] error model=test-model ms=\d+ http=503 code=UNAVAILABLE message="The model is overloaded\. Please try again later\." mapped=upstream_unavailable/);
+  assert.match(log, /\[gemini\] cooldown \d+ms after upstream_unavailable \(consecutive failures: 1\)/);
+  assert.doesNotMatch(log, /test-key|"k"/); // API キーはログに出さない
+});
+
+test('after a 503, the server pauses calls to Gemini (shared cooldown), then recovers on success', async () => {
+  const b = await startServer({ GEMINI_API_KEY: 'k', UPSTREAM_COOLDOWN_BASE_MS: '400', UPSTREAM_COOLDOWN_MAX_MS: '2000' });
+  requests.length = 0;
+  queue.push(overloaded());
+  assert.equal((await post(b, '/api/turn', { speaker: 'A', log: [] })).json.error.code, 'upstream_unavailable');
+  // 待機中は Gemini を呼ばずにすぐ返す（別の閲覧者でも同じ）
+  const c = await post(b, '/api/turn', { speaker: 'B', log: [] }, { ...H, 'x-forwarded-for': '203.0.113.9' });
+  assert.equal(c.status, 503);
+  assert.equal(c.json.error.code, 'upstream_cooldown');
+  assert.ok(c.json.error.retryAfterMs > 0 && c.json.error.retryAfterMs <= 600);
+  assert.match(c.json.error.message, /HTTP 503 UNAVAILABLE/);
+  assert.equal(requests.length, 1);
+  // 待ち時間が過ぎれば、また呼ぶ。成功すれば待ち時間は元に戻る
+  await wait(c.json.error.retryAfterMs + 50);
+  const ok = await post(b, '/api/turn', { speaker: 'A', log: [] });
+  assert.equal(ok.status, 200);
+  assert.equal(requests.length, 2);
+  const again = await post(b, '/api/turn', { speaker: 'B', log: [] });
+  assert.equal(again.status, 200);
+});
+
+test('consecutive 503s lengthen the cooldown up to a cap', async () => {
+  const b = await startServer({ GEMINI_API_KEY: 'k', UPSTREAM_COOLDOWN_BASE_MS: '100', UPSTREAM_COOLDOWN_MAX_MS: '350' });
+  const waits = [];
+  for (let i = 0; i < 4; i++) {
+    queue.push(overloaded(i % 2 ? 500 : 503, i % 2 ? 'INTERNAL' : 'UNAVAILABLE', 'error'));
+    const r = await post(b, '/api/turn', { speaker: 'A', log: [] });
+    assert.equal(r.json.error.code, 'upstream_unavailable');
+    waits.push(r.json.error.retryAfterMs);
+    await wait(r.json.error.retryAfterMs + 20);
+  }
+  assert.ok(waits[1] > waits[0] * 1.5, `grows: ${waits}`);
+  assert.ok(waits.every((w) => w <= 350), `capped: ${waits}`);
+});
+
+test('per-minute 429 with RetryInfo: the suggested delay is passed to the client', async () => {
+  const b = await startServer({ GEMINI_API_KEY: 'k', UPSTREAM_COOLDOWN_BASE_MS: '100', UPSTREAM_COOLDOWN_MAX_MS: '60000' });
+  queue.push({ status: 429, json: { error: { code: 429, status: 'RESOURCE_EXHAUSTED', message: 'Quota exceeded, quotaId: GenerateRequestsPerMinutePerProjectPerModel-FreeTier', details: [{ '@type': 'type.googleapis.com/google.rpc.RetryInfo', retryDelay: '7s' }] } } });
+  const r = await post(b, '/api/turn', { speaker: 'A', log: [] });
+  assert.equal(r.json.error.code, 'upstream_busy');
+  assert.ok(r.json.error.retryAfterMs >= 7000);
+  assert.match(logText(b), /retryAfterMs=7000/);
+});
+
+test('timeout to Gemini is reported as such (not as 503) and triggers the cooldown', async () => {
+  const b = await startServer({ GEMINI_API_KEY: 'k', GEMINI_TIMEOUT_MS: '300', UPSTREAM_COOLDOWN_BASE_MS: '100', UPSTREAM_COOLDOWN_MAX_MS: '200' });
+  queue.push({ ...geminiOk(turn('遅すぎる応答')), delay: 1500 });
+  const r = await post(b, '/api/turn', { speaker: 'A', log: [] });
+  assert.equal(r.status, 504);
+  assert.equal(r.json.error.code, 'timeout');
+  assert.equal(r.json.error.source, 'gemini');
+  await wait(50);
+  assert.match(logText(b), /\[gemini\] error model=test-model ms=\d+ code=TIMEOUT/);
+});
+
+test('non-transient Gemini errors (400) do not start a cooldown', async () => {
+  const b = await startServer({ GEMINI_API_KEY: 'k', UPSTREAM_COOLDOWN_BASE_MS: '5000' });
+  queue.push(geminiErr(400, 'INVALID_ARGUMENT', 'bad schema'));
+  assert.equal((await post(b, '/api/turn', { speaker: 'A', log: [] })).json.error.code, 'bad_request');
+  assert.equal((await post(b, '/api/turn', { speaker: 'A', log: [] })).status, 200);
+});
+
+test('during Gemini trouble the duplicate-regeneration call is skipped (no extra API use)', async () => {
+  const b = await startServer({ GEMINI_API_KEY: 'k', UPSTREAM_COOLDOWN_BASE_MS: '100', UPSTREAM_COOLDOWN_MAX_MS: '100' });
+  queue.push(overloaded());
+  await post(b, '/api/turn', { speaker: 'A', log: [] });
+  await wait(250);
+  requests.length = 0;
+  queue.push(geminiOk(turn('雨だねえ')));
+  const r = await post(b, '/api/turn', { speaker: 'B', log: [{ kind: 'say', speaker: 'B', text: '雨だねえ' }] });
+  assert.equal(r.status, 200);
+  assert.equal(requests.length, 1);
+  assert.equal(r.json.calls, 1);
 });
 
 test('turn: requests from other origins or without the app header are refused', async () => {
