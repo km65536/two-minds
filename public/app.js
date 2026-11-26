@@ -3,6 +3,7 @@
 // Gemini からは「続きの数発言（原則 3）」をまとめて受け取り、一発言ずつ再生しながら、次の数発言を 1 件だけ先読みする。
 // 文脈（会話の状態・直近の発言・再生中の記録）は、このタブのセッション中だけ sessionStorage に置く。
 import { ConversationEngine } from './engine.js';
+import { InputPresence } from './input-state.js';
 
 const SESSION_KEY = 'twominds:session:v4';
 const PACE_KEY = 'twominds:pace';
@@ -447,7 +448,13 @@ function sendPlayer() {
   addBubble(playerBubble(text));
   setRoles(null);
   for (const w of ['A', 'B']) setExpression(w, 'surprised');
-  engine.interrupt(text);
+  // 送信中は、入力状態の判定で会話を止めたり再開したりしない（割り込みが入力待ちを終えて、観察者の発言を優先して再開する）
+  presence.on('send-start');
+  try {
+    engine.interrupt(text);
+  } finally {
+    presence.on('send-end');
+  }
 }
 
 function newConversation() {
@@ -465,30 +472,74 @@ function newConversation() {
 
 /**
  * 仮想キーボードへの対応。
- * ふだんは CSS（position: fixed + inset: 0）が実際の表示領域に合わせるので、ここでは何もしない。
- * 入力欄にフォーカスがあり、キーボードで見えている範囲（visualViewport）が実際に狭くなっているときだけ、
- * 画面全体をその範囲に合わせる。キーボードを閉じたら元に戻し、iOS が残したスクロール位置も戻す。
+ * 画面全体の大きさと位置は、ふだんは CSS（position: fixed + inset: 0）がブラウザの表示領域に合わせる。JS では決めない。
+ * キーボードが表示されていて、入力欄にフォーカスがある間だけ、画面全体を見えている範囲（visualViewport）に合わせる。
+ * そうしないと iOS は入力欄を見せるためにページごと上へずらし、ヘッダーとゲーム画面が画面外に出てしまう。
+ * キーボードを閉じたら上書きを外し、iOS が残したスクロール位置を戻す。
+ * 診断用に ?kb=off でこの調整を止められる。
  */
-let keyboardOpen = false;
-function syncViewport() {
+const KEYBOARD_ADJUST = new URLSearchParams(location.search).get('kb') !== 'off';
+const KEYBOARD_MIN_PX = 120; // これ以上見えている範囲が狭くなったらキーボードとみなす（固定の補正値ではなく判定のしきい値）
+let keyboardVisible = false;
+let viewportFrame = 0;
+
+function measureKeyboard() {
   const vv = window.visualViewport;
-  const layoutH = document.documentElement.clientHeight || window.innerHeight;
-  const focused = document.activeElement === el.input;
-  const open = !!vv && focused && layoutH - vv.height > 120;
-  if (open) {
+  const layoutH = window.innerHeight || document.documentElement.clientHeight;
+  return !!vv && layoutH - vv.height > KEYBOARD_MIN_PX;
+}
+
+function syncViewport() {
+  cancelAnimationFrame(viewportFrame);
+  viewportFrame = requestAnimationFrame(applyViewport);
+}
+
+function applyViewport() {
+  const vv = window.visualViewport;
+  const kb = measureKeyboard();
+  if (kb !== keyboardVisible) {
+    keyboardVisible = kb;
+    debugLog(kb ? 'keyboard shown' : 'keyboard hidden');
+    presence.on(kb ? 'keyboard-show' : 'keyboard-hide');
+  }
+  if (KEYBOARD_ADJUST && kb && presence.s.focused) {
     el.app.classList.add('kbd');
     el.app.style.setProperty('--kb-h', `${Math.round(vv.height)}px`);
     el.app.style.setProperty('--kb-top', `${Math.round(vv.offsetTop)}px`);
-  } else {
+  } else if (el.app.classList.contains('kbd')) {
     el.app.classList.remove('kbd');
     el.app.style.removeProperty('--kb-h');
     el.app.style.removeProperty('--kb-top');
-    // キーボードを閉じたあと、iOS はページを少しスクロールしたまま残すことがある（全体が上にずれて見える原因）
-    if (window.scrollX || window.scrollY || document.scrollingElement?.scrollTop) window.scrollTo(0, 0);
+    resetScroll();
   }
-  keyboardOpen = open;
   const last = el.bubbles.lastElementChild;
   if (last) fitBubbles(last);
+}
+
+// キーボードを閉じたあと、iOS はページを少しスクロールしたまま残すことがある。閉じるアニメーションの間にも何度か戻す
+function resetScroll() {
+  for (const ms of [0, 120, 350]) {
+    setTimeout(() => {
+      if (window.scrollX || window.scrollY || document.scrollingElement?.scrollTop) window.scrollTo(0, 0);
+    }, ms);
+  }
+}
+
+// ---------------- 観察者の入力状態 ----------------
+
+const presence = new InputPresence({
+  isFocused: () => document.activeElement === el.input && !document.hidden,
+  blurInput: () => el.input.blur(),
+  hold: () => engine.hold(),
+  release: () => engine.release(),
+  log: (m) => debugLog(m),
+});
+
+// 診断表示（?debug=1 のときだけ読み込む）
+const debugEvents = [];
+function debugLog(m) {
+  debugEvents.push({ t: performance.now(), m });
+  if (debugEvents.length > 12) debugEvents.shift();
 }
 
 
@@ -505,6 +556,7 @@ function bind() {
 
   // 画面を離れたら止める（再生も先読みも）。戻ったら続きから再開する
   document.addEventListener('visibilitychange', () => {
+    debugLog(document.hidden ? 'hidden' : 'visible');
     if (document.hidden) {
       if (engine.running) {
         pause();
@@ -522,20 +574,23 @@ function bind() {
     window.visualViewport.addEventListener('scroll', syncViewport);
   }
   window.addEventListener('resize', syncViewport);
-  // 観察者が入力欄をタップした瞬間・文字を入力したときは会話を止める。入力欄を離れたら再開する
-  // （送信したときは、sendPlayer の割り込みが入力待ちを終えて、観察者の発言を優先して再開する）
-  el.input.addEventListener('focus', () => {
-    engine.hold();
-    setTimeout(syncViewport, 300);
-  });
-  el.input.addEventListener('input', () => engine.hold());
-  el.input.addEventListener('blur', () => {
-    setTimeout(() => {
-      if (document.activeElement !== el.input) engine.release();
-      syncViewport();
-    }, 150);
-  });
-  // 送信ボタンを押しても入力欄からフォーカスを外さない（外れると、送信の直前に会話が一瞬動き出してしまう）
+  window.addEventListener('orientationchange', () => setTimeout(syncViewport, 300));
+
+  // 観察者の入力状態：会話を止める・再開するのは InputPresence だけが決める（イベントの順番や抜けに左右されない）
+  //  - 入力欄をタップした瞬間（focus）に止める。フォーカスが外れたら（blur・キーボードを閉じた・バックグラウンド）再開する
+  //  - blur が来ないこともあるので、キーボードの非表示・バックグラウンド・1 秒ごとの確認でも判定し直す
+  for (const ev of ['focus', 'blur', 'input', 'compositionstart', 'compositionend']) {
+    el.input.addEventListener(ev, () => {
+      debugLog(ev);
+      presence.on(ev);
+      if (ev === 'focus' || ev === 'blur') applyViewport(); // フォーカスの変化は、次の描画を待たずにすぐ反映する
+    });
+  }
+  document.addEventListener('visibilitychange', () => presence.on(document.hidden ? 'hidden' : 'visible'));
+  window.addEventListener('pagehide', () => presence.on('hidden'));
+  window.addEventListener('pageshow', () => presence.on('visible'));
+  document.addEventListener('focusout', () => setTimeout(() => presence.on('tick'), 0));
+  setInterval(() => presence.on('tick'), 1000);
   for (const ev of ['pointerdown', 'mousedown']) $('sendBtn').addEventListener(ev, (e) => document.activeElement === el.input && e.preventDefault());
 }
 
@@ -546,6 +601,9 @@ function restoreBubbles() {
 
 async function init() {
   engine = createEngine();
+  if (new URLSearchParams(location.search).has('debug')) {
+    import('./debug.js').then((m) => m.startDebug({ el, engine, presence, events: debugEvents, measureKeyboard, keyboardAdjust: KEYBOARD_ADJUST })).catch((e) => console.warn('debug', e));
+  }
   bind();
   syncViewport();
   blinkLoop('A');

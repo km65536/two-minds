@@ -5,7 +5,11 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
   <meta name="theme-color" content="#121524">
   <meta name="apple-mobile-web-app-capable" content="yes">
-  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <!-- ホーム画面から起動したときのステータスバー。black-translucent は使わない。
+       black-translucent + viewport-fit=cover では、iOS が WebView 自体を「画面の高さ − 上の安全領域」にして上端に寄せるため、
+       下端に CSS では埋められない帯が残り、画面全体が上にずれて見える。black（不透明）なら WebView はステータスバーの下から画面の下端まで広がる。
+       この設定はホーム画面に追加した時点で固定されるので、変更後は追加し直す必要がある。 -->
+  <meta name="apple-mobile-web-app-status-bar-style" content="black">
   <title>TWO MINDS</title>
   <meta name="description" content="向かい合った二人のAIが、延々と話し続けるのを眺めるゲーム">
   <link rel="icon" href="icon.svg" type="image/svg+xml">

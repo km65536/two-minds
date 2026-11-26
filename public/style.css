@@ -319,3 +319,21 @@ button, input { font: inherit; color: inherit; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
 }
+
+/* ---------- 実機診断表示（?debug=1 のときだけ） ---------- */
+#debugPanel {
+  position: fixed; z-index: 100;
+  left: calc(env(safe-area-inset-left, 0px) + 4px);
+  top: calc(env(safe-area-inset-top, 0px) + 46px);
+  max-width: min(92vw, 420px); max-height: 60%;
+  overflow: hidden;
+  padding: 6px 8px; border-radius: 8px;
+  background: rgba(0, 0, 0, 0.78); color: #9ef0b0;
+  font: 10px/1.35 ui-monospace, Menlo, monospace;
+  white-space: pre-wrap; word-break: break-all;
+  -webkit-user-select: none; user-select: none;
+}
+.debug-probe {
+  position: fixed; left: 0; top: 0; width: 0; height: 0; visibility: hidden; pointer-events: none;
+  padding: env(safe-area-inset-top, 0px) env(safe-area-inset-right, 0px) env(safe-area-inset-bottom, 0px) env(safe-area-inset-left, 0px);
+}
