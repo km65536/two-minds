@@ -101,6 +101,7 @@ function clientIp(req) {
 
 /** タブごとの識別子（同じタブからの生成が重ならないようにするため。中身は乱数で、個人情報ではない） */
 const inflight = new Map(); // session -> AbortController
+let schemaRejected = null; // Gemini が出力形式（JSON Schema）を拒否したときのエラー（一時的ではないので覚えておく）
 function sessionId(req) {
   const v = req.headers['x-two-minds-session'];
   return typeof v === 'string' && /^[a-z0-9-]{8,64}$/i.test(v) ? `s:${v}` : `ip:${clientIp(req)}`;
@@ -126,7 +127,7 @@ async function handleApi(req, res, url) {
   if (url.pathname === '/api/status' && req.method === 'GET') {
     return send(res, 200, {
       ai: aiAvailable(),
-      reason: !AI_ENABLED ? 'disabled' : !hasCredentials() ? 'no_key' : limiter.dailyExhausted() ? 'daily_limit' : null,
+      reason: !AI_ENABLED ? 'disabled' : !hasCredentials() ? 'no_key' : schemaRejected ? 'schema_rejected' : limiter.dailyExhausted() ? 'daily_limit' : null,
       model: aiAvailable() ? getConfig().model : null,
       playerMax: PLAYER_MAX,
       // クライアントが自分で間隔を調整し、上限にぶつからないようにするための目安
@@ -153,6 +154,8 @@ async function handleApi(req, res, url) {
       if (!interrupt) throw new AIError('in_progress', '会話を生成中です。', { status: 409, retryable: true });
       previous.abort();
     }
+    // 出力形式が一度拒否されたら、同じリクエストを繰り返さない（設定を直して再起動するまで）
+    if (schemaRejected) throw schemaRejected;
     // Gemini が混雑中なら、呼ばずに待ち時間を返す（上限の回数も消費しない）
     gate.check();
     const ip = clientIp(req);
@@ -165,6 +168,10 @@ async function handleApi(req, res, url) {
       return send(res, 200, { episode, demo: false, gen, calls });
     } catch (err) {
       if (err instanceof SupersededError) throw new AIError('superseded', '新しい会話の生成に切り替えました。', { status: 409 });
+      if (err?.code === 'schema_rejected') {
+        schemaRejected = err;
+        console.error(`[gemini] schema rejected: ${err.upstream?.message || ''} — 以降の生成を止めます。GEMINI_SCHEMA_MODE=json で回避できます（設定後に再起動）`);
+      }
       if (isUpstreamTransient(err)) {
         const wait = gate.onFailure(err.upstream?.httpStatus ? `HTTP ${err.upstream.httpStatus}${err.upstream.status ? ` ${err.upstream.status}` : ''}` : err.upstream?.status || err.code, err.retryAfterMs);
         err.retryAfterMs = Math.max(err.retryAfterMs || 0, wait);

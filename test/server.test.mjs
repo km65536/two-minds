@@ -14,19 +14,27 @@ const logs = {};
 let mock;
 let base;
 
-const line = (speaker, text, extra = {}) => ({ speaker, text, expression: 'neutral', action: 'none', type: 'chat', phase: 'FREE', pause: 'none', ...extra });
-const episode = (lines = [line('A', 'お茶、ぬるくなっちゃった'), line('B', 'ほんとだ。なんでぬるいとまずいんだろう', { type: 'question', phase: 'DISCOVERY' })], extra = {}) => ({
+// Gemini が返す平らな形（簡略化したスキーマどおり）
+const line = (speaker, text, extra = {}) => ({ speaker, text, expression: 'neutral', action: 'none', tag: 'FREE chat none', ...extra });
+const episode = (lines = [line('A', 'お茶、ぬるくなっちゃった'), line('B', 'ほんとだ。なんでぬるいとまずいんだろう', { tag: 'DISCOVERY question' })], extra = {}) => ({
   summary: 'ぬるいお茶の話',
   topic: 'お茶',
-  problem: { exists: true, question: 'ぬるいお茶はなぜまずいか', kind: 'science', status: 'exploring', leo_view: '期待とのズレ', mina_view: '香り', explored: [], conclusion: '', unresolved_reason: '', open_points: [] },
+  question: 'ぬるいお茶はなぜまずいか',
+  status: 'continuing',
+  leo_view: '期待とのズレ',
+  mina_view: '香り',
+  explored: '',
+  conclusion: '',
   lines,
-  next: { hook: '飲み物', deferred_questions: [], continue_problem: true },
-  notes: { A: '', B: '' },
+  deferred: '',
+  note_leo: '',
+  note_mina: '',
   ...extra,
 });
 const geminiText = (text, finishReason = 'STOP') => ({ status: 200, json: { candidates: [{ content: { role: 'model', parts: [{ text }] }, finishReason, index: 0 }], usageMetadata: { promptTokenCount: 900, candidatesTokenCount: 400 } } });
 const geminiOk = (obj = episode(), finishReason) => geminiText(JSON.stringify(obj), finishReason);
 const geminiErr = (code, status, message, details) => ({ status: code, json: { error: { code, message, status, ...(details ? { details } : {}) } } });
+const schemaTooComplex = () => geminiErr(400, 'INVALID_ARGUMENT', 'The specified schema produces a constraint that has too many states for serving.  Typical causes of this error are schemas with lots of text (for example, very long property or enum names), schemas with long array length limits (especially when nested), or schemas using complex value matchers (for example, integers or numbers with minimum/maximum bounds or strings with complex formats like date-time)');
 const overloaded = (code = 503, status = 'UNAVAILABLE', message = 'The model is overloaded. Please try again later.') => geminiErr(code, status, message);
 
 const freePort = () => new Promise((r) => { const s = http.createServer(); s.listen(0, '127.0.0.1', () => { const p = s.address().port; s.close(() => r(p)); }); });
@@ -60,7 +68,9 @@ before(async () => {
     req.on('data', (c) => (body += c));
     req.on('end', () => {
       requests.push({ url: req.url, headers: req.headers, body: JSON.parse(body || '{}') });
-      const next = queue.shift() || geminiOk(episode([line('A', `いつもの話その${requests.length}`), line('B', `うん、続けて${requests.length}`)]));
+      let next = queue.shift() || geminiOk(episode([line('A', `いつもの話その${requests.length}`), line('B', `うん、続けて${requests.length}`)]));
+      // 模擬：スキーマの複雑さを判定する（本物の Gemini の判定ではない）
+      if (next.checkSchema) next = next.checkSchema(requests.at(-1).body.generationConfig?.responseJsonSchema) ? schemaTooComplex() : geminiOk(next.episode);
       setTimeout(() => {
         if (res.destroyed) return;
         res.writeHead(next.status, { 'content-type': 'application/json' });
@@ -108,7 +118,7 @@ test('per-utterance endpoint is gone', async () => {
 
 test('episode: one Gemini call returns a whole validated conversation record', async () => {
   requests.length = 0;
-  queue.push(geminiOk(episode([line('A', 'お茶、ぬるくなっちゃった', { expression: 'troubled', action: 'sip' }), line('B', 'ほんとだ。なんでぬるいとまずいんだろう', { type: 'question', phase: 'DISCOVERY', expression: 'thinking' }), line('A', '期待とのズレかな', { type: 'hypothesis', phase: 'EXPLORATION', pause: 'short' })])));
+  queue.push(geminiOk(episode([line('A', 'お茶、ぬるくなっちゃった', { expression: 'troubled', action: 'sip' }), line('B', 'ほんとだ。なんでぬるいとまずいんだろう', { tag: 'DISCOVERY question', expression: 'thinking' }), line('A', '期待とのズレかな', { tag: 'EXPLORATION hypothesis short' })])));
   const r = await post(base, {
     gen: 3,
     context: {
@@ -132,7 +142,9 @@ test('episode: one Gemini call returns a whole validated conversation record', a
   assert.match(req.url, /models\/test-model:generateContent/);
   assert.equal(req.headers['x-goog-api-key'], 'test-key');
   assert.equal(req.body.generationConfig.responseMimeType, 'application/json');
-  assert.ok(req.body.generationConfig.responseJsonSchema.properties.lines);
+  const schema = req.body.generationConfig.responseJsonSchema;
+  assert.ok(schema.properties.lines);
+  assert.doesNotMatch(JSON.stringify(schema), /"enum"|"maxItems"|"minItems"/); // 簡略化したスキーマが送られている
   assert.equal(req.body.generationConfig.maxOutputTokens, 8192);
   const sys = JSON.stringify(req.body.systemInstruction);
   assert.match(sys, /レオ/);
@@ -145,7 +157,7 @@ test('episode: one Gemini call returns a whole validated conversation record', a
 
 test('episode: the observer interrupt is sent with the played lines and current hypotheses', async () => {
   requests.length = 0;
-  queue.push(geminiOk(episode([line('B', '観察者さん、それほんと？', { type: 'answer_player' }), line('A', 'じゃあ僕の仮説は外れか', { type: 'concede' })])));
+  queue.push(geminiOk(episode([line('B', '観察者さん、それほんと？', { tag: 'EXPLORATION answer_player' }), line('A', 'じゃあ僕の仮説は外れか', { tag: 'EXPLORATION concede' })])));
   const r = await post(base, {
     context: { recent: [{ kind: 'say', speaker: 'A', text: '前の話' }] },
     interrupt: { text: '答えは香りだよ', played: [{ kind: 'say', speaker: 'A', text: 'なんでぬるいとまずいの' }], problem: { question: 'ぬるいお茶はなぜまずいか', leo_view: '期待とのズレ', mina_view: '温度', status: 'exploring' } },
@@ -312,6 +324,83 @@ test('optional thinking level is sent when configured', async () => {
   requests.length = 0;
   await post(b, { context: {} });
   assert.deepEqual(requests[0].body.generationConfig.thinkingConfig, { thinkingLevel: 'LOW' });
+});
+
+// ---------- 簡略化したスキーマ・出力形式の拒否 ----------
+
+/**
+ * 模擬の判定（本物の Gemini ではない）：Gemini の 400「too many states」の説明にある原因
+ * （enum、配列の長さの制約、入れ子）を含むスキーマを拒否する。
+ */
+function tooComplex(schema) {
+  if (!schema) return false;
+  const json = JSON.stringify(schema);
+  const enums = (json.match(/"enum"/g) || []).length;
+  const limits = (json.match(/"(minItems|maxItems|minLength|maxLength|minimum|maximum|pattern|format)"/g) || []).length;
+  const objects = (json.match(/"type":"object"/g) || []).length;
+  return enums > 0 || limits > 0 || objects > 3;
+}
+
+const OLD_COMPLEX_SCHEMA = {
+  type: 'object',
+  properties: {
+    problem: { type: 'object', properties: { kind: { type: 'string', enum: ['none', 'science'] }, status: { type: 'string', enum: ['none', 'resolved'] } } },
+    lines: { type: 'array', maxItems: 36, items: { type: 'object', properties: { speaker: { type: 'string', enum: ['A', 'B'] }, phase: { type: 'string', enum: ['FREE', 'DISCOVERY'] } } } },
+  },
+};
+
+test('[mock] the simplified schema passes a complexity check that the previous schema fails (not the real Gemini)', async () => {
+  assert.equal(tooComplex(OLD_COMPLEX_SCHEMA), true);
+  requests.length = 0;
+  queue.push({ checkSchema: tooComplex, episode: episode() });
+  const r = await post(base, { context: {} });
+  assert.equal(r.status, 200, JSON.stringify(r.json));
+  assert.equal(tooComplex(requests[0].body.generationConfig.responseJsonSchema), false);
+});
+
+test('schema rejected (400 too many states): clear non-retryable error, and Gemini is not called again', async () => {
+  const b = await startServer({ GEMINI_API_KEY: 'k' });
+  requests.length = 0;
+  queue.push(schemaTooComplex());
+  const r = await post(b, { context: {} });
+  assert.equal(r.status, 502);
+  assert.equal(r.json.error.code, 'schema_rejected');
+  assert.equal(r.json.error.retryable, false);
+  assert.equal(r.json.error.source, 'gemini');
+  assert.match(r.json.error.message, /出力形式.*HTTP 400 INVALID_ARGUMENT/);
+  assert.equal(r.headers.get('retry-after'), null);
+  // 同じリクエストは繰り返さない：別のタブからでも Gemini を呼ばずに同じエラーを返す
+  const again = await post(b, { context: {} });
+  assert.equal(again.json.error.code, 'schema_rejected');
+  assert.equal(requests.length, 1);
+  assert.equal((await (await fetch(b + '/api/status')).json()).reason, 'schema_rejected');
+  await wait(50);
+  const log = logText(b);
+  assert.match(log, /\[gemini\] error .*http=400 code=INVALID_ARGUMENT message="The specified schema produces a constraint that has too many states/);
+  assert.match(log, /\[gemini\] schema rejected/);
+  assert.doesNotMatch(log, /cooldown/); // 一時的な障害としては扱わない
+});
+
+test('other 400 errors are not retried either, but do not block later requests', async () => {
+  const b = await startServer({ GEMINI_API_KEY: 'k' });
+  requests.length = 0;
+  queue.push(geminiErr(400, 'INVALID_ARGUMENT', 'Request contains an invalid argument.'));
+  const r = await post(b, { context: {} });
+  assert.equal(r.json.error.code, 'bad_request');
+  assert.equal(r.json.error.retryable, false);
+  assert.equal(requests.length, 1);
+  assert.equal((await post(b, { context: {} })).status, 200);
+});
+
+test('GEMINI_SCHEMA_MODE=json sends no schema (JSON output only) and still validates the result', async () => {
+  const b = await startServer({ GEMINI_API_KEY: 'k', GEMINI_SCHEMA_MODE: 'json' });
+  requests.length = 0;
+  queue.push(geminiOk(episode([line('A', '一つ目の発言だよ'), line('B', '二つ目の発言だね', { expression: '笑顔', tag: 'AFTERMATH joke' })])));
+  const r = await post(b, { context: {} });
+  assert.equal(r.status, 200);
+  assert.equal(requests[0].body.generationConfig.responseMimeType, 'application/json');
+  assert.equal(requests[0].body.generationConfig.responseJsonSchema, undefined);
+  assert.deepEqual([r.json.episode.lines[1].expression, r.json.episode.lines[1].phase, r.json.episode.lines[1].type], ['smile', 'AFTERMATH', 'joke']);
 });
 
 // ---------- 安全機構 ----------

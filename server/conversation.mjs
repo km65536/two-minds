@@ -200,12 +200,23 @@ export function buildSystemPrompt() {
     '- 毎回同じあいさつで始める。前回と同じ話題を繰り返す。相手の言葉を言い換えるだけ。毎回質問で終わる。不自然に褒め合う。自分の性格を説明する。ト書きや名前の前置きを text に書く。',
     '',
     '## 出力',
-    '指定された JSON 形式だけを返す。',
+    '次の項目を持つ JSON オブジェクトだけを返す。すべて文字列（lines だけは配列）。該当しない項目は空文字にする。',
     '- summary: この会話の概要（80 字以内）。topic: 話題（15 字以内）。',
-    '- problem: 今回扱った問題。問題がなければ exists=false、kind=none、status=none。leo_view / mina_view は二人それぞれの最初の意見や仮説。explored は検討した内容。conclusion は結論。unresolved_reason は未解決の理由。open_points は残った論点。',
-    '- lines: 発言の配列。speaker は A（レオ）か B（ミナ）。expression は表情、action は動作、type は発言の種類、phase は会話の状態、pause は発言の前の間（long は考え込む沈黙）。',
-    '- next: hook は次の会話につながりそうなこと。deferred_questions は後回しにした疑問。continue_problem は次回も今の問題を続けたいか。',
-    '- notes: それぞれが自分だけ覚えておきたい小さなこと（相手の癖、考えが変わったことなど）を 30 字以内で。なければ空文字。',
+    '- question: 今回扱った問い。問題が出なかったら空文字。',
+    '- status: 問いの結末。resolved（解決）/ unresolved（未解決）/ continuing（次回も続けたい）/ none（問題なし）のどれか。',
+    '- leo_view / mina_view: 二人それぞれの最初の意見や仮説。',
+    '- explored: 検討したこと（「 / 」区切り）。',
+    '- conclusion: 結論。未解決なら、その理由と残った論点。',
+    '- lines: 発言の配列（6〜36 個）。各発言は speaker・text・expression・action・tag の 5 項目。',
+    '  - speaker: A（レオ）または B（ミナ）。text: 発言の本文。',
+    '  - expression: 表情。neutral / smile / laugh / surprised / thinking / troubled / annoyed / sad のどれか。',
+    '  - action: 動作。none / nod / tilt / lean / laugh / shrug / look_away / sip / think のどれか。',
+    '  - tag: 「会話の状態 発言の種類 発言前の間」を空白区切りで。例: "EXPLORATION hypothesis short"。',
+    '    - 会話の状態: FREE / DISCOVERY / EXPLORATION / RESOLUTION / AFTERMATH',
+    '    - 発言の種類: chat / joke / question / hypothesis / objection / agree / concede / insight / conclusion / aside / react / answer_player',
+    '    - 発言前の間: none / short / long（long は考え込む沈黙）',
+    '- deferred: 後回しにした疑問（「 / 」区切り。なければ空文字）。',
+    '- note_leo / note_mina: それぞれが自分だけ覚えておきたい小さなこと（相手の癖、考えが変わったことなど、30 字以内）。',
   ].join('\n');
 }
 
@@ -265,61 +276,113 @@ export function buildEpisodePrompt({ ctx, interrupt = null, rng = Math.random })
 }
 
 // ---------- 出力のスキーマ（Gemini responseJsonSchema） ----------
+// Gemini は JSON Schema を「出力の制約」に変換して使う。enum・配列の個数制約（minItems / maxItems）・
+// 入れ子のオブジェクトが重なると制約の状態数が増えすぎて、400「too many states for serving」で拒否される。
+// そのため、スキーマは「文字列の項目」と「文字列 5 項目の発言の配列」だけにする。
+// 値の候補（表情・動作・会話の状態など）はプロンプトで伝え、サーバー側で検証・補正する。
 
-const s = (extra = {}) => ({ type: 'string', ...extra });
+export const MODEL_FIELDS = ['summary', 'topic', 'question', 'status', 'leo_view', 'mina_view', 'explored', 'conclusion', 'lines', 'deferred', 'note_leo', 'note_mina'];
+export const LINE_FIELDS = ['speaker', 'text', 'expression', 'action', 'tag'];
+
+const STR = { type: 'string' };
 export const EPISODE_SCHEMA = {
   type: 'object',
-  properties: {
-    summary: s(),
-    topic: s(),
-    problem: {
-      type: 'object',
-      properties: {
-        exists: { type: 'boolean' },
-        question: s(),
-        kind: s({ enum: PROBLEM_KINDS }),
-        status: s({ enum: PROBLEM_STATUS }),
-        leo_view: s(),
-        mina_view: s(),
-        explored: { type: 'array', items: s() },
-        conclusion: s(),
-        unresolved_reason: s(),
-        open_points: { type: 'array', items: s() },
-      },
-      required: ['exists', 'question', 'kind', 'status', 'leo_view', 'mina_view', 'explored', 'conclusion', 'unresolved_reason', 'open_points'],
-      propertyOrdering: ['exists', 'question', 'kind', 'status', 'leo_view', 'mina_view', 'explored', 'conclusion', 'unresolved_reason', 'open_points'],
-    },
-    lines: {
-      type: 'array',
-      minItems: 1,
-      maxItems: EPISODE_MAX_LINES,
-      items: {
-        type: 'object',
-        properties: {
-          speaker: s({ enum: ['A', 'B'] }),
-          text: s(),
-          expression: s({ enum: EXPRESSIONS }),
-          action: s({ enum: ACTIONS }),
-          type: s({ enum: LINE_TYPES }),
-          phase: s({ enum: PHASES }),
-          pause: s({ enum: PAUSES }),
-        },
-        required: ['speaker', 'text', 'expression', 'action', 'type', 'phase', 'pause'],
-        propertyOrdering: ['speaker', 'text', 'expression', 'action', 'type', 'phase', 'pause'],
-      },
-    },
-    next: {
-      type: 'object',
-      properties: { hook: s(), deferred_questions: { type: 'array', items: s() }, continue_problem: { type: 'boolean' } },
-      required: ['hook', 'deferred_questions', 'continue_problem'],
-      propertyOrdering: ['hook', 'deferred_questions', 'continue_problem'],
-    },
-    notes: { type: 'object', properties: { A: s(), B: s() }, required: ['A', 'B'], propertyOrdering: ['A', 'B'] },
-  },
-  required: ['summary', 'topic', 'problem', 'lines', 'next', 'notes'],
-  // 問題の計画 → 発言の順に書かせる。途中で切れても、発言は先頭から取り出せる
-  propertyOrdering: ['summary', 'topic', 'problem', 'lines', 'next', 'notes'],
+  properties: Object.fromEntries(
+    MODEL_FIELDS.map((k) => [
+      k,
+      k === 'lines'
+        ? {
+            type: 'array',
+            items: { type: 'object', properties: Object.fromEntries(LINE_FIELDS.map((f) => [f, STR])), required: LINE_FIELDS, propertyOrdering: LINE_FIELDS },
+          }
+        : STR,
+    ]),
+  ),
+  required: MODEL_FIELDS,
+  // 問いと二人の仮説 → 発言の順に書かせる。途中で切れても、発言は先頭から取り出せる
+  propertyOrdering: MODEL_FIELDS,
 };
+
+// ---------- モデルの出力（平らな形）→ ゲームで使う形 ----------
+
+const SPEAKER_ALIASES = { a: 'A', leo: 'A', 'レオ': 'A', b: 'B', mina: 'B', 'ミナ': 'B' };
+const EXPRESSION_ALIASES = { 笑顔: 'smile', 笑う: 'laugh', 驚き: 'surprised', 考え中: 'thinking', 困惑: 'troubled', 困り顔: 'troubled', 不満: 'annoyed', 悲しい: 'sad', 普通: 'neutral', happy: 'smile', confused: 'troubled', angry: 'annoyed', thoughtful: 'thinking' };
+const ACTION_ALIASES = { うなずく: 'nod', 首をかしげる: 'tilt', 身を乗り出す: 'lean', 笑う: 'laugh', 肩をすくめる: 'shrug', 目をそらす: 'look_away', 飲む: 'sip', 考える: 'think', smile: 'none', lookaway: 'look_away', 'look-away': 'look_away' };
+const STATUS_ALIASES = { resolved: 'resolved', 解決: 'resolved', unresolved: 'unresolved', 未解決: 'unresolved', continuing: 'continuing', continue: 'continuing', 継続: 'continuing', exploring: 'exploring', open: 'exploring', none: 'none', なし: 'none' };
+
+function fromAlias(v, list, aliases, d) {
+  const t = oneLine(String(v ?? '')).toLowerCase();
+  if (!t) return d;
+  if (list.includes(t)) return t;
+  if (aliases[t]) return aliases[t];
+  const raw = oneLine(String(v));
+  return aliases[raw] || d;
+}
+
+/** tag（"EXPLORATION hypothesis short" など）から、会話の状態・発言の種類・発言前の間を読む。順番や区切りの違いは許す */
+export function parseTag(tag, prevPhase = 'FREE') {
+  const tokens = oneLine(String(tag ?? '')).split(/[\s,，、/|・:：]+/).filter(Boolean);
+  let phase = null;
+  let type = null;
+  let pause = null;
+  for (const raw of tokens) {
+    const up = raw.toUpperCase();
+    const lo = raw.toLowerCase();
+    if (!phase && PHASES.includes(up)) phase = up;
+    else if (!type && LINE_TYPES.includes(lo)) type = lo;
+    else if (!pause && PAUSES.includes(lo)) pause = lo;
+  }
+  return { phase: phase || prevPhase, type: type || 'chat', pause: pause || 'none' };
+}
+
+const splitList = (v, n) => oneLine(String(v ?? '')).split(/\s*(?:\/|／|\n|・)\s*/).map((x) => x.trim()).filter(Boolean).slice(0, n);
+
+/** モデルが返した平らな JSON を、normalizeEpisode が扱う形に変換する（欠けた項目は既定値） */
+export function fromModelOutput(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const question = oneLine(str(raw.question, 120));
+  // 問いがあるのに status が none / 空なら、「探っている途中」とみなす
+  const mapped = fromAlias(raw.status, PROBLEM_STATUS, STATUS_ALIASES, 'exploring');
+  const status = question ? (mapped === 'none' ? 'exploring' : mapped) : 'none';
+  let prevPhase = 'FREE';
+  const lines = (Array.isArray(raw.lines) ? raw.lines : []).map((l) => {
+    if (!l || typeof l !== 'object') return null;
+    const t = parseTag(l.tag, prevPhase);
+    prevPhase = t.phase;
+    return {
+      speaker: fromAlias(l.speaker, ['A', 'B'], SPEAKER_ALIASES, l.speaker === 'A' || l.speaker === 'B' ? l.speaker : null),
+      text: l.text,
+      expression: fromAlias(l.expression, EXPRESSIONS, EXPRESSION_ALIASES, 'neutral'),
+      action: fromAlias(l.action, ACTIONS, ACTION_ALIASES, 'none'),
+      ...t,
+    };
+  });
+  const unresolved = status === 'unresolved';
+  return {
+    summary: raw.summary,
+    topic: raw.topic,
+    problem: {
+      exists: !!question,
+      question,
+      kind: 'daily_mystery',
+      status,
+      leo_view: raw.leo_view,
+      mina_view: raw.mina_view,
+      explored: splitList(raw.explored, 6),
+      conclusion: unresolved ? '' : raw.conclusion,
+      unresolved_reason: unresolved ? raw.conclusion : '',
+      open_points: [],
+    },
+    lines,
+    next: { hook: '', deferred_questions: splitList(raw.deferred, 3), continue_problem: status === 'continuing' },
+    notes: { A: raw.note_leo, B: raw.note_mina },
+  };
+}
+
+/** Gemini の出力を検証して、ゲームで再生できる形にする（再生できる発言が 2 つ未満なら null） */
+export function normalizeModelEpisode(raw, opts) {
+  return normalizeEpisode(fromModelOutput(raw), opts);
+}
 
 // ---------- 出力の検証と正規化 ----------
 
@@ -401,27 +464,25 @@ export function normalizeEpisode(raw, { recent = [], truncated = false } = {}) {
 }
 
 /**
- * 出力が上限で途中で切れたとき、lines 配列の中の「完全な発言オブジェクト」だけを取り出す。
- * 文字列の中の括弧やエスケープを考慮して、JSON として閉じているものだけを返す。
+ * 出力が上限で途中で切れたとき（または形式が崩れたとき）、読める部分だけを取り出す。
+ * lines より前の文字列項目と、lines 配列の中で JSON として閉じている発言オブジェクトだけを返す。
+ * 文字列の中の括弧やエスケープを考慮する。
  */
 export function salvageEpisode(text) {
   if (typeof text !== 'string') return null;
+  const li = text.indexOf('"lines"');
+  if (li < 0) return null;
   const head = {};
-  for (const key of ['summary', 'topic']) {
-    const m = text.match(new RegExp(`"${key}"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"`));
+  const before = text.slice(0, li);
+  for (const key of MODEL_FIELDS) {
+    if (key === 'lines') continue;
+    const m = before.match(new RegExp(`"${key}"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"`));
     if (m) {
       try {
         head[key] = JSON.parse(`"${m[1]}"`);
       } catch {}
     }
   }
-  const pm = text.indexOf('"problem"');
-  if (pm >= 0) {
-    const obj = readObject(text, text.indexOf('{', pm));
-    if (obj) head.problem = obj;
-  }
-  const li = text.indexOf('"lines"');
-  if (li < 0) return null;
   let i = text.indexOf('[', li);
   if (i < 0) return null;
   const lines = [];
@@ -435,7 +496,7 @@ export function salvageEpisode(text) {
     const after = text.slice(i).match(/^\s*(,|\])/);
     if (!after || after[1] === ']') break;
   }
-  return { ...head, problem: head.problem?.value, lines };
+  return { ...head, lines };
 }
 
 function readObject(text, start) {

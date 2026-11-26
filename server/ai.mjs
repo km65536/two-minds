@@ -1,6 +1,6 @@
 // Gemini API 呼び出し。API キーはサーバー側の環境変数からのみ読み込む。
 import { GoogleGenAI, ApiError } from '@google/genai';
-import { buildEpisodePrompt, EPISODE_SCHEMA, normalizeEpisode, salvageEpisode } from './conversation.mjs';
+import { buildEpisodePrompt, EPISODE_SCHEMA, normalizeModelEpisode, salvageEpisode } from './conversation.mjs';
 
 export class AIError extends Error {
   /**
@@ -60,6 +60,8 @@ export function getConfig() {
     maxOutputTokens: Number(process.env.GEMINI_MAX_OUTPUT_TOKENS) || 8192,
     // 思考の深さ（例: low）。未設定なら送らず、モデルの既定値を使う
     thinkingLevel: (process.env.GEMINI_THINKING_LEVEL || '').trim().toUpperCase(), // MINIMAL / LOW / MEDIUM / HIGH
+    // 出力形式の指定方法。schema = 簡略化した JSON Schema を送る（既定）/ json = スキーマを送らず JSON 出力だけを指定する
+    schemaMode: (process.env.GEMINI_SCHEMA_MODE || 'schema').trim().toLowerCase() === 'json' ? 'json' : 'schema',
   };
 }
 
@@ -101,7 +103,7 @@ async function callEpisode({ system, user }, signal) {
       config: {
         systemInstruction: system,
         responseMimeType: 'application/json',
-        responseJsonSchema: EPISODE_SCHEMA,
+        ...(cfg.schemaMode === 'schema' ? { responseJsonSchema: EPISODE_SCHEMA } : {}),
         maxOutputTokens: cfg.maxOutputTokens,
         temperature: 1.0,
         ...(cfg.thinkingLevel ? { thinkingConfig: { thinkingLevel: cfg.thinkingLevel } } : {}),
@@ -173,7 +175,11 @@ export function toAIError(err) {
     }
     if (err.status === 401 || err.status === 403) return new AIError('auth', 'サーバーの API キーが無効か、権限がありません。', { status: 503, ...g });
     if (err.status === 404) return new AIError('model', 'AI モデルが見つかりません（GEMINI_MODEL を確認してください）。', { status: 503, ...g });
-    if (err.status === 400) return new AIError('bad_request', 'AI へのリクエストが拒否されました。', { status: 502, ...g });
+    if (err.status === 400 && /too many states|schema produces a constraint|response_?(json_?)?schema/i.test(up.message || err.message || '')) {
+      // 出力形式（JSON Schema）が受け付けられない。同じリクエストを繰り返しても結果は変わらない
+      return new AIError('schema_rejected', 'AI（Gemini）が会話の出力形式を受け付けませんでした（HTTP 400 INVALID_ARGUMENT）。サーバー側の設定の見直しが必要です。', { status: 502, ...g });
+    }
+    if (err.status === 400) return new AIError('bad_request', `AI（Gemini）がリクエストを受け付けませんでした（HTTP 400${up.status ? ` ${up.status}` : ''}）。`, { status: 502, ...g });
     if ([500, 502, 503, 504].includes(err.status)) {
       // Gemini 側の一時的な障害・過負荷（503 UNAVAILABLE = "The model is overloaded" など）
       return new AIError('upstream_unavailable', `Google の AI（Gemini）が一時的に応答できません（HTTP ${err.status}${up.status ? ` ${up.status}` : ''}）。`, { status: 503, retryable: true, ...g });
@@ -196,7 +202,7 @@ export async function generateEpisode({ ctx, interrupt = null, reserve = () => {
   reserve();
   const { data, truncated, ms } = await callEpisode(prompt, signal);
   const recent = interrupt ? [] : ctx.recent;
-  const episode = normalizeEpisode(data, { recent, truncated });
+  const episode = normalizeModelEpisode(data, { recent, truncated });
   if (!episode) {
     logUpstream('invalid', { model: getConfig().model, ms, lines: Array.isArray(data?.lines) ? data.lines.length : 0, truncated });
     throw new AIError('bad_output', 'AI の会話記録の形式が正しくありませんでした。', { status: 502, retryable: true, source: 'gemini' });

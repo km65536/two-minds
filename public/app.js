@@ -629,13 +629,17 @@ function handleError(err) {
   if (code === 'too_fast' || code === 'busy') {
     return errors >= 4 ? stopWithError(err) : Math.max(err.retryAfterMs || 0, [3000, 6000, 10000][errors - 1] || 10000);
   }
+  if (code === 'schema_rejected') {
+    // 一時的なエラーではないので、待ってもやり直さない（サーバー側の設定を直すまで再開できない）
+    return stopWithError(err, { resumable: false });
+  }
   return stopWithError(err);
 }
 
-function stopWithError(err) {
+function stopWithError(err, { resumable = true } = {}) {
   pause();
   setStatus('error');
-  notice(`${err?.message || 'エラーが発生しました。'} ▶ で再開できます。`, 'error');
+  notice(`${err?.message || 'エラーが発生しました。'}${resumable ? ' ▶ で再開できます。' : ''}`, 'error');
   return null;
 }
 
@@ -792,7 +796,7 @@ async function init() {
   } catch {
     serverStatus = { ai: false, reason: 'offline' };
   }
-  const aiOk = serverStatus.ai && serverStatus.reason !== 'daily_limit';
+  const aiOk = serverStatus.ai && !['daily_limit', 'schema_rejected'].includes(serverStatus.reason);
   setMode(aiOk ? 'ai' : 'demo');
 
   const why = aiOk
@@ -801,6 +805,7 @@ async function init() {
         no_key: 'サーバーに AI の API キーが設定されていません。',
         disabled: 'AI 会話は現在停止しています。',
         daily_limit: '今日の AI 会話の上限に達しました。',
+        schema_rejected: 'AI（Gemini）が会話の出力形式を受け付けなかったため、AI 会話を止めています（サーバー側の設定の見直しが必要です）。',
         offline: 'サーバーに接続できませんでした。',
       }[serverStatus.reason] || 'いまは AI を利用できません。') + 'デモモード（AI ではない、用意した台本の会話）で動きます。';
 

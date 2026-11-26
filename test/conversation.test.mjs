@@ -1,6 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  fromModelOutput,
+  normalizeModelEpisode,
+  parseTag,
+  MODEL_FIELDS,
+  LINE_FIELDS,
   buildSystemPrompt,
   buildEpisodePrompt,
   sanitizeContext,
@@ -134,25 +139,114 @@ test('normalizeEpisode: problem status, continuation and truncation', () => {
   assert.equal(normalizeEpisode(episode(lines, { problem: { ...p, question: '' } })).problem.exists, false);
 });
 
+// Gemini が実際に返す平らな形
+const modelLine = (speaker, text, extra = {}) => ({ speaker, text, expression: 'neutral', action: 'none', tag: 'FREE chat none', ...extra });
+const modelOutput = (lines, extra = {}) => ({ summary: 'テスト', topic: 'お茶', question: '', status: 'none', leo_view: '', mina_view: '', explored: '', conclusion: '', lines, deferred: '', note_leo: '', note_mina: '', ...extra });
+
 test('salvageEpisode: recovers complete lines from a truncated JSON (strings with braces and quotes)', () => {
-  const full = JSON.stringify(episode([line('A', '括弧 {こういうの} と "引用" があっても'), line('B', 'だいじょうぶ？'), line('A', 'ここで切れる')]));
+  const full = JSON.stringify(modelOutput([modelLine('A', '括弧 {こういうの} と "引用" があっても'), modelLine('B', 'だいじょうぶ？'), modelLine('A', 'ここで切れる')], { question: 'なぜ？', leo_view: 'レオ説' }));
   const cut = full.slice(0, full.indexOf('ここで切れる') + 3);
   const s = salvageEpisode(cut);
   assert.equal(s.lines.length, 2);
   assert.equal(s.lines[0].text, '括弧 {こういうの} と "引用" があっても');
   assert.equal(s.summary, 'テスト');
-  assert.equal(s.problem.exists, false);
-  const ep = normalizeEpisode(s, { truncated: true });
+  assert.equal(s.leo_view, 'レオ説');
+  const ep = normalizeModelEpisode(s, { truncated: true });
   assert.equal(ep.lines.length, 2);
   assert.equal(ep.truncated, true);
+  assert.equal(ep.problem.question, 'なぜ？');
+  assert.equal(ep.problem.status, 'exploring'); // 途中で切れたので「探っている途中」のまま次へ
   assert.equal(salvageEpisode('{"summary":"x"'), null);
   assert.equal(salvageEpisode(123), null);
 });
 
-test('schema: problem is planned before lines; all fields required', () => {
-  assert.deepEqual(EPISODE_SCHEMA.propertyOrdering, ['summary', 'topic', 'problem', 'lines', 'next', 'notes']);
-  assert.deepEqual(EPISODE_SCHEMA.required, EPISODE_SCHEMA.propertyOrdering);
-  assert.equal(EPISODE_SCHEMA.properties.lines.maxItems, EPISODE_MAX_LINES);
+// ---------- 簡略化したスキーマ ----------
+
+/** スキーマを走査して、Gemini で状態数が増える原因になる要素を数える */
+function schemaStats(schema) {
+  const st = { enums: 0, arrayLimits: 0, stringLimits: 0, depth: 0, objects: 0, props: 0, types: new Set(), keywords: new Set() };
+  const walk = (node, depth) => {
+    st.depth = Math.max(st.depth, depth);
+    for (const k of Object.keys(node)) st.keywords.add(k);
+    st.types.add(node.type);
+    if (node.enum) st.enums++;
+    if ('minItems' in node || 'maxItems' in node) st.arrayLimits++;
+    if ('minLength' in node || 'maxLength' in node || 'pattern' in node || 'format' in node) st.stringLimits++;
+    if (node.type === 'object') {
+      st.objects++;
+      st.props += Object.keys(node.properties).length;
+      for (const v of Object.values(node.properties)) walk(v, depth + 1);
+    }
+    if (node.type === 'array') walk(node.items, depth + 1);
+  };
+  walk(schema, 0);
+  return st;
+}
+
+test('schema is simplified: no enum, no array/string limits, at most one array of flat objects', () => {
+  const st = schemaStats(EPISODE_SCHEMA);
+  assert.equal(st.enums, 0);
+  assert.equal(st.arrayLimits, 0);
+  assert.equal(st.stringLimits, 0);
+  assert.equal(st.objects, 2); // 全体と、1 発言
+  assert.ok(st.depth <= 3, `depth ${st.depth}`); // 全体 → lines → 発言 → 文字列
+  assert.deepEqual([...st.types].sort(), ['array', 'object', 'string']);
+  // Gemini の responseJsonSchema が受け付けるキーワードだけを使う
+  const allowed = new Set(['type', 'properties', 'required', 'items', 'propertyOrdering']);
+  for (const k of st.keywords) assert.ok(allowed.has(k), `unexpected keyword ${k}`);
+  assert.deepEqual(Object.keys(EPISODE_SCHEMA.properties), MODEL_FIELDS);
+  assert.deepEqual(Object.keys(EPISODE_SCHEMA.properties.lines.items.properties), LINE_FIELDS);
+  assert.deepEqual(LINE_FIELDS, ['speaker', 'text', 'expression', 'action', 'tag']);
+  // 問い・仮説 → 発言の順（途中で切れても発言を先頭から取り出せる）
+  assert.ok(MODEL_FIELDS.indexOf('question') < MODEL_FIELDS.indexOf('lines'));
+  assert.ok(JSON.stringify(EPISODE_SCHEMA).length < 1500);
+});
+
+test('the value choices removed from the schema are described in the prompt instead', () => {
+  const p = buildSystemPrompt();
+  for (const k of MODEL_FIELDS) assert.match(p, new RegExp(`${k}`));
+  for (const v of ['neutral', 'surprised', 'troubled', 'nod', 'look_away', 'EXPLORATION', 'AFTERMATH', 'hypothesis', 'answer_player', 'long']) assert.match(p, new RegExp(v));
+  assert.match(p, /6〜36 個/);
+});
+
+test('fromModelOutput: tolerant parsing of speaker, expression, action, tag and status', () => {
+  const ep = normalizeModelEpisode(
+    modelOutput(
+      [
+        modelLine('レオ', 'ねえ、お茶がぬるい', { expression: '笑顔', action: 'うなずく', tag: 'FREE, chat' }),
+        modelLine('mina', 'なんでだろう', { expression: 'THINKING', action: 'tilt', tag: 'question DISCOVERY short' }),
+        modelLine('A', '香りかも', { expression: '???', action: 'dance', tag: 'hypothesis' }), // 状態は前の発言を引き継ぐ
+        modelLine('B', 'たぶんね', { tag: 'RESOLUTION conclusion long' }),
+        modelLine('C', '誰？'),
+      ],
+      { question: 'ぬるいお茶はなぜまずい', status: '未解決', conclusion: '確かめる方法がない', explored: '香り / 期待 / 舌', deferred: '冷たいお茶は？ / 氷の音' },
+    ),
+  );
+  assert.equal(ep.lines.length, 4);
+  assert.deepEqual(ep.lines.map((l) => l.speaker), ['A', 'B', 'A', 'B']);
+  assert.deepEqual(ep.lines[0], { speaker: 'A', text: 'ねえ、お茶がぬるい', expression: 'smile', action: 'nod', type: 'chat', phase: 'FREE', pause: 'none' });
+  assert.deepEqual([ep.lines[1].phase, ep.lines[1].type, ep.lines[1].pause, ep.lines[1].expression], ['DISCOVERY', 'question', 'short', 'thinking']);
+  assert.deepEqual([ep.lines[2].phase, ep.lines[2].type, ep.lines[2].expression, ep.lines[2].action], ['DISCOVERY', 'hypothesis', 'neutral', 'none']);
+  assert.equal(ep.lines[3].pause, 'long');
+  assert.equal(ep.problem.status, 'unresolved');
+  assert.equal(ep.problem.unresolved_reason, '確かめる方法がない');
+  assert.equal(ep.problem.conclusion, '');
+  assert.deepEqual(ep.problem.explored, ['香り', '期待', '舌']);
+  assert.deepEqual(ep.next.deferred_questions, ['冷たいお茶は？', '氷の音']);
+  assert.deepEqual(parseTag('', 'EXPLORATION'), { phase: 'EXPLORATION', type: 'chat', pause: 'none' });
+});
+
+test('fromModelOutput: missing fields get defaults; no question means no problem; continuing is kept', () => {
+  const bare = normalizeModelEpisode({ lines: [{ speaker: 'A', text: 'こんばんは、今日は寒いね' }, { speaker: 'B', text: 'ほんと' }] });
+  assert.equal(bare.lines.length, 2);
+  assert.equal(bare.problem.exists, false);
+  assert.equal(bare.problem.status, 'none');
+  assert.equal(bare.lines[0].phase, 'FREE');
+  const cont = normalizeModelEpisode(modelOutput([modelLine('A', '続きを考えよう'), modelLine('B', 'うん、まだ分からない')], { question: '夢はなぜ忘れる', status: 'continuing' }));
+  assert.equal(cont.problem.status, 'continuing');
+  assert.equal(cont.next.continue_problem, true);
+  assert.equal(fromModelOutput(null), null);
+  assert.equal(normalizeModelEpisode({ lines: 'nope' }), null);
 });
 
 test('cleanText and similarity', () => {
