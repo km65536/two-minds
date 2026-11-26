@@ -17,14 +17,14 @@ try {
 
 const { generateTurn, hasCredentials, getConfig, AIError } = await import('./ai.mjs');
 const { demoTurn } = await import('./demo.mjs');
-const { sanitizeLog, PLAYER_MAX } = await import('./conversation.mjs');
+const { sanitizeLog, sanitizeContext, PLAYER_MAX } = await import('./conversation.mjs');
 const { Limiter, limitsFromEnv } = await import('./limits.mjs');
 
 const PUBLIC_DIR = path.join(root, 'public');
 const PORT = Number(process.env.PORT) || 3000;
 // Render では外部から届くよう 0.0.0.0 で待ち受ける。ローカルでは自分の PC からのみ。
 const HOST = process.env.HOST || (process.env.RENDER ? '0.0.0.0' : '127.0.0.1');
-const MAX_BODY = 16 * 1024;
+const MAX_BODY = 24 * 1024;
 const AI_ENABLED = (process.env.AI_ENABLED ?? 'true').toLowerCase() !== 'false';
 const limiter = new Limiter(limitsFromEnv());
 
@@ -118,6 +118,8 @@ async function handleApi(req, res, url) {
       reason: !AI_ENABLED ? 'disabled' : !hasCredentials() ? 'no_key' : limiter.dailyExhausted() ? 'daily_limit' : null,
       model: aiAvailable() ? getConfig().model : null,
       playerMax: PLAYER_MAX,
+      // クライアントが自分で間隔を調整し、上限にぶつからないようにするための目安
+      pace: { perMinute: limiter.o.ipRpmLimit, minIntervalMs: limiter.o.ipMinIntervalMs },
     });
   }
 
@@ -126,14 +128,15 @@ async function handleApi(req, res, url) {
     const body = await readJSON(req);
     const speaker = body.speaker === 'B' ? 'B' : 'A';
     const log = sanitizeLog(body.log);
-    if (body.mode === 'demo') return send(res, 200, { ...demoTurn({ speaker, log }), demo: true });
+    const ctx = sanitizeContext(body.context);
+    if (body.mode === 'demo') return send(res, 200, { ...demoTurn({ speaker, log, ctx }), demo: true });
 
     if (!AI_ENABLED) throw new AIError('disabled', 'AI 会話は現在停止しています。', { status: 503 });
     if (!hasCredentials()) throw new AIError('no_key', 'サーバーに API キーが設定されていません。', { status: 503 });
     const ip = clientIp(req);
     const end = limiter.begin(ip);
     try {
-      const turn = await generateTurn({ speaker, log, reserve: () => limiter.take(ip) });
+      const turn = await generateTurn({ speaker, log, ctx, reserve: () => limiter.take(ip) });
       return send(res, 200, { ...turn, demo: false });
     } finally {
       end();

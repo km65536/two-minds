@@ -14,8 +14,10 @@ export class AIError extends Error {
 export function getConfig() {
   return {
     model: process.env.GEMINI_MODEL?.trim() || 'gemini-3.5-flash-lite',
-    // 出力トークンの上限（1 発言は短いので小さめ。使いすぎ防止も兼ねる）
-    maxOutputTokens: Number(process.env.GEMINI_MAX_OUTPUT_TOKENS) || 1024,
+    // 出力トークンの上限（思考トークンも出力に含まれるため、短い発言でも余裕を持たせる）
+    maxOutputTokens: Number(process.env.GEMINI_MAX_OUTPUT_TOKENS) || 2048,
+    // 思考の深さ（例: low）。未設定なら送らず、モデルの既定値を使う
+    thinkingLevel: (process.env.GEMINI_THINKING_LEVEL || '').trim().toUpperCase(), // MINIMAL / LOW / MEDIUM / HIGH
   };
 }
 
@@ -52,6 +54,7 @@ async function callJSON({ system, user }) {
         responseJsonSchema: TURN_SCHEMA,
         maxOutputTokens: cfg.maxOutputTokens,
         temperature: 1.0,
+        ...(cfg.thinkingLevel ? { thinkingConfig: { thinkingLevel: cfg.thinkingLevel } } : {}),
       },
     });
   } catch (err) {
@@ -77,8 +80,11 @@ export function toAIError(err) {
   if (err instanceof AIError) return err;
   if (err instanceof ApiError) {
     if (err.status === 429) {
-      // Gemini 側の無料枠（分間/日次）に達した
-      return new AIError('upstream_quota', 'AI の無料枠の上限に達しました。しばらくしてからお試しください。', { status: 429 });
+      // Gemini 側の無料枠に達した。1 日の上限か、1 分あたりの上限かを区別する
+      if (/per ?day|PerDay|daily/i.test(err.message || '')) {
+        return new AIError('upstream_quota', '今日の AI の無料枠の上限に達しました。', { status: 429 });
+      }
+      return new AIError('upstream_busy', 'AI が混み合っています。少し待ってから続けます。', { status: 429, retryable: true });
     }
     if (err.status === 400 && /api key/i.test(err.message)) {
       return new AIError('auth', 'サーバーの API キーが無効です。', { status: 503 });
@@ -98,19 +104,25 @@ export function toAIError(err) {
  * 1 発言を生成する。reserve() は API を 1 回呼ぶ直前に呼ばれ、上限を超えていれば例外を投げる。
  * 重複時の作り直しも上限に数えるため、呼び出し回数は必ず reserve を通る。
  */
-export async function generateTurn({ speaker, log, reserve = () => {} }) {
-  const prompt = buildTurnPrompt({ speaker, log });
-  reserve();
-  let turn = normalizeTurn(await callJSON(prompt));
+export async function generateTurn({ speaker, log, ctx, reserve = () => {} }) {
+  const prompt = buildTurnPrompt({ speaker, log, ctx });
+  let calls = 0;
+  const take = () => {
+    reserve();
+    calls++;
+  };
+  take();
+  let turn = normalizeTurn(await callJSON(prompt), prompt.analysis);
 
   if (!turn.text || findDuplicate(turn.text, log)) {
     try {
-      reserve();
+      take();
       const retry = normalizeTurn(
         await callJSON({
           system: prompt.system,
           user: `${prompt.user}\n\n# 注意\n次の発言は直前の会話と重複していたので使えません。違う角度・違う言葉で話してください:\n「${turn.text}」`,
         }),
+        prompt.analysis,
       );
       if (retry.text && !findDuplicate(retry.text, log)) turn = retry;
     } catch (err) {
@@ -119,5 +131,6 @@ export async function generateTurn({ speaker, log, reserve = () => {} }) {
     }
     if (!turn.text) throw new AIError('empty', 'AI が発言を生成できませんでした。', { status: 502, retryable: true });
   }
-  return turn;
+  // calls: この発言のために使った API 呼び出し回数（クライアントが間隔の調整に使う）
+  return { ...turn, calls };
 }
