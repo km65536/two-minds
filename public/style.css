@@ -31,6 +31,8 @@ html, body {
   overscroll-behavior: none;
   background: var(--sky-1);
 }
+/* body 自体を画面に固定し、iOS がページをスクロールさせて固定要素ごと動かすのを防ぐ */
+body { position: fixed; inset: 0; }
 body {
   color: var(--text);
   font-family: 'Zen Maru Gothic', -apple-system, 'Hiragino Maru Gothic ProN', 'Hiragino Sans', 'Noto Sans JP', sans-serif;
@@ -43,19 +45,19 @@ body {
 button, input { font: inherit; color: inherit; }
 [hidden] { display: none !important; }
 
-/* 画面全体：表示領域ぴったりの固定レイアウト。ページ自体は決してスクロールしない */
+/* 画面全体：表示領域ぴったりの固定レイアウト。ページ自体は決してスクロールしない。
+   大きさは JS で決めず、position: fixed + inset: 0 でブラウザの実際の表示領域に合わせる。
+   （iOS のホーム画面起動では、この領域がステータスバーの下まで含む画面全体になり、
+   上下の安全領域は env(safe-area-inset-*) でよける。visualViewport の値はこの領域と一致しないことがあるので使わない） */
 .app {
-  position: fixed; left: 0; top: 0;
-  width: 100%;
-  height: 100vh;
-  height: 100svh;
-  height: 100dvh;
+  position: fixed;
+  top: 0; right: 0; bottom: 0; left: 0;
   display: grid;
   grid-template-rows: auto minmax(0, 1fr) auto;
   overflow: hidden;
 }
-/* 仮想キーボード表示中などは、JS が visualViewport の実寸を渡す */
-.app.vv { height: var(--app-h); top: var(--app-top, 0px); }
+/* 仮想キーボードが表示されている間だけ、見えている範囲（visualViewport）に合わせる */
+.app.kbd { bottom: auto; top: var(--kb-top, 0px); height: var(--kb-h, 100%); }
 
 /* ---------- header ---------- */
 .topbar {
@@ -72,6 +74,7 @@ button, input { font: inherit; color: inherit; }
 .status[data-state='running'] .dot { background: #93d3a2; animation: pulse 2s infinite; }
 .status[data-state='quiet'] .dot { background: #93a8d3; }
 .status[data-state='thinking'] .dot { background: #b7a6e0; animation: pulse 1.6s infinite; }
+.status[data-state='holding'] .dot { background: var(--p); }
 .status[data-state='waiting'] .dot { background: var(--warn); animation: pulse 1.2s infinite; }
 .status[data-state='paused'] .dot { background: var(--warn); }
 .status[data-state='error'] .dot { background: var(--danger); }

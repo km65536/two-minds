@@ -14,31 +14,50 @@ async function until(cond, ms = 3000) {
 
 /** 偽の画面・通信。リクエストは手動で応答させる */
 function harness(opts = {}) {
-  const log = { requests: [], played: [], cut: [], status: [], waits: [], stops: [], notices: [], maxInflight: 0, saves: 0 };
+  const log = { requests: [], played: [], cut: [], status: [], waits: [], stops: [], notices: [], progress: [], maxInflight: 0, saves: 0, holds: 0 };
   let inflight = 0;
   let engine;
   const io = {
     request(body, signal) {
       return new Promise((resolve, reject) => {
-        const r = { body, signal, resolve: (v) => { inflight--; resolve(v); }, reject: (e) => { inflight--; reject(e); }, at: Date.now(), playingWhenSent: !!engine.current, linesPlayedWhenSent: log.played.length };
+        // 実際の fetch と同じく、取り消したリクエストはその時点で終わる（同時に処理中の数から外す）
+        let settled = false;
+        const settle = () => {
+          if (!settled) {
+            settled = true;
+            inflight--;
+          }
+        };
+        const r = { body, signal, resolve: (v) => { if (!settled) { settle(); resolve(v); } else resolve(v); }, reject: (e) => { settle(); reject(e); }, at: Date.now(), playingWhenSent: !!engine.current, linesPlayedWhenSent: log.played.length };
         inflight++;
-        log.maxInflight = Math.max(log.maxInflight, inflight);
         log.requests.push(r);
-        signal?.addEventListener('abort', () => {
+        const onAbort = () => {
           r.aborted = true;
-        });
+          settle();
+        };
+        if (signal?.aborted) onAbort();
+        else signal?.addEventListener('abort', onAbort);
+        log.maxInflight = Math.max(log.maxInflight, inflight);
       });
     },
+    // 実際の画面と同じく、少しずつ表示する（1 ステップごとに engine.sleep で待つ）
     async play(line, g, onProgress) {
-      onProgress(line.text.slice(0, Math.ceil(line.text.length / 2)));
-      const ok = await engine.sleep(opts.playMs ?? 15, g);
-      if (!ok) {
-        log.cut.push(line.text);
-        return false;
+      const steps = 5;
+      const chars = Array.from(line.text);
+      for (let k = 1; k <= steps; k++) {
+        const shown = chars.slice(0, Math.ceil((chars.length * k) / steps)).join('');
+        onProgress(shown);
+        log.progress.push({ t: Date.now(), text: line.text, n: shown.length });
+        const ok = await engine.sleep((opts.playMs ?? 15) / steps, g);
+        if (!ok) {
+          log.cut.push(line.text);
+          return false;
+        }
       }
       log.played.push(line.text);
       return true;
     },
+    onHold: () => log.holds++,
     setStatus: (s) => log.status.push(s),
     showWait: (t) => log.waits.push(t),
     clearWait: () => {},
@@ -50,7 +69,7 @@ function harness(opts = {}) {
     paceWait: () => 0,
     notePace: () => {},
   };
-  engine = new ConversationEngine(io, { gap: () => 1, backoff: [20, 40, 60, 80], jitter: 0, badOutputDelay: 20, ...opts.engine });
+  engine = new ConversationEngine(io, { gap: () => 1, backoff: [20, 40, 60, 80], jitter: 0, badOutputDelay: 20, resumeDelay: 5, ...opts.engine });
   return { engine, log };
 }
 
@@ -317,5 +336,146 @@ test('daily limit switches to clearly labeled demo mode and continues', async ()
   assert.equal(engine.mode, 'demo');
   assert.equal(log.requests[1].body.mode, 'demo');
   assert.match(log.notices[0], /デモモード（AI ではありません）/);
+  engine.pause();
+});
+
+// ---------- 観察者が入力している間は止める ----------
+
+test('hold: playback stops immediately (mid-line) and nothing advances while typing', async () => {
+  const { engine, log } = harness({ playMs: 100 });
+  engine.start();
+  await until(() => log.requests.length === 1);
+  respond(log.requests[0], ['1-1 一つ目の発言です', '1-2 二つ目の発言です', '1-3 三つ目の発言です']);
+  await until(() => log.progress.some((p) => p.text.startsWith('1-1')));
+  await tick(30); // 1 発言目を話している途中
+  engine.hold();
+  const at = log.progress.length;
+  const heldAt = Date.now();
+  await tick(250);
+  // 止めた時点で表示途中だった 1 ステップ以外は進まない
+  assert.ok(log.progress.length - at <= 1, `advanced ${log.progress.length - at} steps while held`);
+  assert.ok(log.progress.slice(at).every((p) => p.t - heldAt < 40));
+  assert.deepEqual(log.played, []);
+  assert.equal(log.status.at(-1), 'holding');
+  assert.equal(log.holds, 1);
+  assert.equal(engine.current.lines.length, 3); // キューは消えていない
+  engine.pause();
+});
+
+test('hold → release without sending: resumes from the same place; nothing is lost, replayed or reordered', async () => {
+  const { engine, log } = harness({ playMs: 50 });
+  engine.start();
+  await until(() => log.requests.length === 1);
+  respond(log.requests[0], ['1-1 一つ目の発言です', '1-2 二つ目の発言です', '1-3 三つ目の発言です']);
+  await until(() => log.requests.length === 2); // 先読み中
+  await until(() => log.played.length === 1);
+  await tick(15);
+  engine.hold();
+  respond(log.requests[1], ['2-1 続きの一つ目', '2-2 続きの二つ目']); // 入力中に先読みが届く → 保存される
+  await tick(150);
+  assert.equal(log.played.length, 1);
+  assert.ok(engine.next && engine.next.lines.length === 2);
+  assert.equal(log.requests.length, 2); // 入力中に新しい生成は始めない
+  engine.release();
+  await until(() => log.played.length === 5);
+  assert.deepEqual(log.played, ['1-1 一つ目の発言です', '1-2 二つ目の発言です', '1-3 三つ目の発言です', '2-1 続きの一つ目', '2-2 続きの二つ目']);
+  assert.equal(log.cut.length, 0); // 途中の発言は捨てずに続きから
+  await until(() => log.requests.length === 3); // 再開後、2 つ目の記録の再生開始で次を先読み
+  assert.equal(log.maxInflight, 1);
+  engine.pause();
+});
+
+test('hold while a generation is in flight (nothing queued): the response is kept and played only after release', async () => {
+  const { engine, log } = harness({ playMs: 10 });
+  engine.start();
+  await until(() => log.requests.length === 1);
+  engine.hold();
+  respond(log.requests[0], ['1-1 届いた発言', '1-2 その次']);
+  await tick(120);
+  assert.deepEqual(log.played, []);
+  assert.equal(log.requests.length, 1);
+  engine.release();
+  await until(() => log.played.length === 2);
+  assert.deepEqual(log.played, ['1-1 届いた発言', '1-2 その次']);
+  engine.pause();
+});
+
+test('hold → send: the observer is answered first; the queue and the old prefetch are handled by the interrupt', async () => {
+  const { engine, log } = harness({ playMs: 40 });
+  engine.start();
+  await until(() => log.requests.length === 1);
+  respond(log.requests[0], ['1-1 一つ目の発言です', '1-2 二つ目の発言です', '1-3 三つ目の発言です']);
+  await until(() => log.requests.length === 2);
+  await until(() => log.played.length === 1);
+  engine.hold();
+  const prefetch = log.requests[1];
+  await tick(60);
+  engine.interrupt('ねえ、ちょっといい？');
+  assert.equal(engine.held, false);
+  await until(() => log.requests.length === 3);
+  assert.equal(prefetch.signal.aborted, true);
+  respond(prefetch, ['OLD-1', 'OLD-2']); // 古い応答は使わない
+  const ir = log.requests[2];
+  assert.equal(ir.body.interrupt.text, 'ねえ、ちょっといい？');
+  assert.equal(ir.body.context.recent.at(-1).text, 'ねえ、ちょっといい？');
+  respond(ir, ['R-1 観察者さんへの返事', 'R-2 それから']);
+  await until(() => log.played.length === 3);
+  assert.deepEqual(log.played.slice(1), ['R-1 観察者さんへの返事', 'R-2 それから']); // 観察者への反応から自然につながる
+  assert.ok(!log.played.some((t) => t.startsWith('OLD')));
+  engine.pause();
+});
+
+test('repeated typing and sending: no duplicates, no reordering, one request at a time', async () => {
+  const { engine, log } = harness({ playMs: 20 });
+  engine.start();
+  await until(() => log.requests.length === 1);
+  respond(log.requests[0], ['1-1 最初の発言', '1-2 二つ目']);
+  await until(() => log.played.length === 1);
+  // 1 回目：入力 → 送信
+  engine.hold();
+  engine.interrupt('一回目のメッセージ');
+  await until(() => log.requests.length >= 2);
+  const r1 = log.requests.at(-1);
+  // 応答を待つ間にもう一度入力を始める → 応答が届いても再生しない
+  engine.hold();
+  respond(r1, ['A-1 一回目への返事', 'A-2 その続き']);
+  await tick(80);
+  assert.ok(!log.played.includes('A-1 一回目への返事'));
+  // 2 回目：送信 → 届いていた返事（未再生）は割り込みで捨て、新しい発言に答える
+  engine.interrupt('二回目のメッセージ');
+  await until(() => log.requests.filter((r) => r.body.interrupt).length === 2);
+  const r2 = log.requests.at(-1);
+  assert.equal(r2.body.interrupt.text, '二回目のメッセージ');
+  const recent = r2.body.context.recent.map((e) => e.text);
+  assert.deepEqual(recent.slice(-2), ['一回目のメッセージ', '二回目のメッセージ']); // 順番どおり
+  respond(r2, ['B-1 二回目への返事', 'B-2 その続き']);
+  await until(() => log.played.includes('B-2 その続き'));
+  assert.equal(new Set(log.played).size, log.played.length);
+  assert.ok(log.played.indexOf('1-1 最初の発言') < log.played.indexOf('B-1 二回目への返事'));
+  assert.equal(log.maxInflight, 1);
+  engine.pause();
+});
+
+test('pause and hold together: releasing while paused stays paused; a pending retry does not fire a request while typing', async () => {
+  const { engine, log } = harness({ playMs: 5 });
+  engine.start();
+  await until(() => log.requests.length === 1);
+  fail(log.requests[0], 'upstream_unavailable', { message: 'Gemini 503', retryAfterMs: 60 });
+  await tick(5);
+  engine.hold();
+  await tick(150); // 再試行の時刻を過ぎても、入力中は送らない
+  assert.equal(log.requests.length, 1);
+  engine.release();
+  await until(() => log.requests.length === 2); // 入力をやめたら送る
+  respond(log.requests[1], ['1-1 復旧した', '1-2 続き']);
+  await until(() => log.played.length === 2);
+  engine.hold();
+  engine.pause();
+  engine.release();
+  assert.equal(log.status.at(-1), 'paused');
+  await tick(80);
+  assert.equal(engine.running, false);
+  engine.start();
+  await until(() => log.requests.length >= 3);
   engine.pause();
 });

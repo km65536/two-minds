@@ -57,7 +57,7 @@ const sleep = (ms, g) => engine.sleep(ms, g);
 // ---------------- 表示 ----------------
 
 function setStatus(state) {
-  const labels = { idle: '待機中', running: '会話中', thinking: '考え中', quiet: '静かな間', waiting: '応答待ち', paused: '一時停止中', error: '停止中' };
+  const labels = { idle: '待機中', running: '会話中', thinking: '考え中', quiet: '静かな間', waiting: '応答待ち', holding: '入力中', paused: '一時停止中', error: '停止中' };
   const running = !!engine?.running;
   el.status.dataset.state = state;
   el.statusText.textContent = labels[state];
@@ -412,6 +412,10 @@ function createEngine() {
       },
       paceWait,
       notePace,
+      // 観察者が入力を始めたら、話している途中でも口を閉じて止まる（続きは同じ位置から）
+      onHold: () => {
+        for (const w of ['A', 'B']) el.chars[w].dataset.shape = restShape(el.chars[w].dataset.expr);
+      },
     },
     { gap: gapAfter },
   );
@@ -459,16 +463,30 @@ function newConversation() {
 
 // ---------------- 画面サイズ（仮想キーボード対応） ----------------
 
+/**
+ * 仮想キーボードへの対応。
+ * ふだんは CSS（position: fixed + inset: 0）が実際の表示領域に合わせるので、ここでは何もしない。
+ * 入力欄にフォーカスがあり、キーボードで見えている範囲（visualViewport）が実際に狭くなっているときだけ、
+ * 画面全体をその範囲に合わせる。キーボードを閉じたら元に戻し、iOS が残したスクロール位置も戻す。
+ */
+let keyboardOpen = false;
 function syncViewport() {
   const vv = window.visualViewport;
-  if (!vv) return;
-  el.app.classList.add('vv');
-  el.app.style.setProperty('--app-h', `${Math.round(vv.height)}px`);
-  el.app.style.setProperty('--app-top', `${Math.round(vv.offsetTop)}px`);
-  el.app.classList.toggle('kbd', window.innerHeight - vv.height > 120);
-  if (document.scrollingElement && document.scrollingElement.scrollTop && !el.app.classList.contains('kbd')) {
-    document.scrollingElement.scrollTop = 0;
+  const layoutH = document.documentElement.clientHeight || window.innerHeight;
+  const focused = document.activeElement === el.input;
+  const open = !!vv && focused && layoutH - vv.height > 120;
+  if (open) {
+    el.app.classList.add('kbd');
+    el.app.style.setProperty('--kb-h', `${Math.round(vv.height)}px`);
+    el.app.style.setProperty('--kb-top', `${Math.round(vv.offsetTop)}px`);
+  } else {
+    el.app.classList.remove('kbd');
+    el.app.style.removeProperty('--kb-h');
+    el.app.style.removeProperty('--kb-top');
+    // キーボードを閉じたあと、iOS はページを少しスクロールしたまま残すことがある（全体が上にずれて見える原因）
+    if (window.scrollX || window.scrollY || document.scrollingElement?.scrollTop) window.scrollTo(0, 0);
   }
+  keyboardOpen = open;
   const last = el.bubbles.lastElementChild;
   if (last) fitBubbles(last);
 }
@@ -504,8 +522,21 @@ function bind() {
     window.visualViewport.addEventListener('scroll', syncViewport);
   }
   window.addEventListener('resize', syncViewport);
-  el.input.addEventListener('focus', () => setTimeout(syncViewport, 300));
-  el.input.addEventListener('blur', () => setTimeout(syncViewport, 300));
+  // 観察者が入力欄をタップした瞬間・文字を入力したときは会話を止める。入力欄を離れたら再開する
+  // （送信したときは、sendPlayer の割り込みが入力待ちを終えて、観察者の発言を優先して再開する）
+  el.input.addEventListener('focus', () => {
+    engine.hold();
+    setTimeout(syncViewport, 300);
+  });
+  el.input.addEventListener('input', () => engine.hold());
+  el.input.addEventListener('blur', () => {
+    setTimeout(() => {
+      if (document.activeElement !== el.input) engine.release();
+      syncViewport();
+    }, 150);
+  });
+  // 送信ボタンを押しても入力欄からフォーカスを外さない（外れると、送信の直前に会話が一瞬動き出してしまう）
+  for (const ev of ['pointerdown', 'mousedown']) $('sendBtn').addEventListener(ev, (e) => document.activeElement === el.input && e.preventDefault());
 }
 
 function restoreBubbles() {

@@ -33,6 +33,7 @@ export class ConversationEngine {
       badOutputMax: 3,
       limitWaitMax: 4,
       badOutputDelay: 4000, // 形式の崩れた応答のあと、もう一度要求するまでの待ち
+      resumeDelay: 600, // 入力をやめて会話に戻るときの、ひと呼吸
       idleChunks: 30, // 操作がないまま、この数の記録を再生したら一時停止（見ていない間の使いすぎ防止）
       jitter: 2000,
       gap: () => 1000, // 発言と発言の間（line, nextLine, { boundary }）→ ms
@@ -61,12 +62,30 @@ export class ConversationEngine {
     this.stats = { requests: 0, played: 0 };
     this.sleepers = new Set();
     this.nextWaiters = new Set();
+    // 観察者が入力している間は、再生を止める（一時停止とは別。キュー・状態・生成中の応答はそのまま）
+    this.held = false;
+    this.holdWaiters = new Set();
+    this.shownStatus = null; // 入力中に、本来出すはずだった状態表示
   }
 
   // ---------- 待ち合わせ ----------
 
-  /** 世代が変わったら途中で抜ける待ち時間 */
-  sleep(ms, g = this.gen) {
+  /**
+   * 世代が変わったら途中で抜ける待ち時間。観察者が入力している間は、待ち終わっても入力が終わるまで先へ進まない
+   * （発言を 1 文字ずつ表示する待ちもこれを使うので、入力を始めると話している途中でもすぐ止まる）
+   */
+  async sleep(ms, g = this.gen) {
+    if (!(await this.timer(ms, g))) return false;
+    if (this.held) {
+      await this.untilReleased(g);
+      if (g !== this.gen) return false;
+      // 入力をやめて戻ってきたら、ひと呼吸おいてから続ける
+      if (!(await this.timer(this.o.resumeDelay, g))) return false;
+    }
+    return g === this.gen;
+  }
+
+  timer(ms, g = this.gen) {
     return new Promise((resolve) => {
       if (g !== this.gen) return resolve(false);
       const s = {};
@@ -79,6 +98,28 @@ export class ConversationEngine {
       s.cancel = () => done(false);
       this.sleepers.add(s);
     });
+  }
+
+  /** 観察者の入力が終わる（または割り込み・リセットで世代が変わる）まで待つ */
+  untilReleased(g) {
+    return new Promise((resolve) => {
+      if (!this.held || g !== this.gen) return resolve();
+      this.holdWaiters.add(resolve);
+    });
+  }
+
+  wakeHold() {
+    for (const r of [...this.holdWaiters]) r();
+    this.holdWaiters.clear();
+  }
+
+  /** 状態表示。入力中は「入力中」を優先し、本来の表示は入力が終わってから出す */
+  setStatus(state) {
+    if (this.held && !['holding', 'paused', 'error'].includes(state)) {
+      this.shownStatus = state;
+      return;
+    }
+    this.io.setStatus(state);
   }
 
   waitForNext(g) {
@@ -97,6 +138,7 @@ export class ConversationEngine {
     this.gen++;
     for (const s of [...this.sleepers]) s.cancel();
     this.wake();
+    this.wakeHold();
   }
 
   // ---------- 文脈 ----------
@@ -139,7 +181,8 @@ export class ConversationEngine {
 
   /** 次の記録が必要で、まだ誰も要求していなければ、1 件だけ要求する */
   ensureNext() {
-    if (!this.running || this.failure || this.next || this.inflight || this.retryTimer) return;
+    // 入力中は新しい生成を始めない（送信されたら割り込みになり、作っても捨てることになるため）。生成中の応答は受け取る
+    if (!this.running || this.held || this.failure || this.next || this.inflight || this.retryTimer) return;
     const interrupt = this.pendingInterrupt;
     const wait = this.io.paceWait({ interrupt: !!interrupt }) || 0;
     if (wait > 0) {
@@ -247,10 +290,10 @@ export class ConversationEngine {
 
   showWaiting() {
     if (this.waitInfo) {
-      this.io.setStatus('waiting');
+      this.setStatus('waiting');
       this.io.showWait(this.waitInfo.text);
     } else {
-      this.io.setStatus('thinking');
+      this.setStatus('thinking');
     }
   }
 
@@ -262,6 +305,10 @@ export class ConversationEngine {
     this.loopGen = g;
     try {
       while (this.running && g === this.gen) {
+        if (this.held) {
+          await this.untilReleased(g);
+          continue;
+        }
         if (!this.current) {
           if (this.next) {
             this.current = this.next;
@@ -286,7 +333,7 @@ export class ConversationEngine {
         // この記録の再生を始めたら、すぐに次の記録を先読みする（1 件だけ）
         c.prefetched = true;
         this.ensureNext();
-        this.io.setStatus('running');
+        this.setStatus('running');
         const line = c.lines[c.idx];
         this.speaking = { line, shown: '' };
         const done = await this.io.play(line, g, (shown) => {
@@ -314,7 +361,7 @@ export class ConversationEngine {
   stopWithFailure() {
     const f = this.failure;
     this.running = false;
-    this.io.setStatus('error');
+    this.setStatus('error');
     this.io.clearWait();
     this.io.onStop(f.message, { resumable: f.resumable });
     this.save();
@@ -331,7 +378,7 @@ export class ConversationEngine {
       this.limitWaits = 0;
     }
     if (this.failure) {
-      this.io.setStatus('error');
+      this.setStatus('error');
       return;
     }
     this.running = true;
@@ -345,13 +392,44 @@ export class ConversationEngine {
     this.running = false;
     clearTimeout(this.retryTimer);
     this.retryTimer = null;
-    this.io.setStatus('paused');
+    this.setStatus('paused');
     this.wake();
     this.save();
   }
 
-  /** 観察者の発言：最優先で処理する */
+  /**
+   * 観察者が入力を始めた：会話の再生をすぐに止める。
+   * キュー（再生中・先読み済みの記録）、会話の状態、生成中のリクエストは捨てない。新しい生成だけ始めない。
+   */
+  hold() {
+    if (this.held) return;
+    this.held = true;
+    this.shownStatus = null;
+    this.io.onHold?.();
+    this.io.setStatus('holding');
+  }
+
+  /** 送信せずに入力をやめた：止まったところから会話を再開する */
+  release() {
+    if (!this.held) return;
+    this.held = false;
+    this.wakeHold();
+    const s = this.shownStatus;
+    this.shownStatus = null;
+    if (!this.running) {
+      this.io.setStatus(this.failure ? 'error' : 'paused');
+      return;
+    }
+    this.io.setStatus(s || (this.current ? 'running' : 'thinking'));
+    if (this.waitInfo && !this.current) this.io.showWait(this.waitInfo.text);
+    this.ensureNext();
+    this.loop();
+  }
+
+  /** 観察者の発言：最優先で処理する（入力中だった場合も、ここで入力待ちを終える） */
   interrupt(text) {
+    this.held = false;
+    this.shownStatus = null;
     // 1. 再生中の発言を止める（世代を進めると、再生も待ちもすぐ抜ける）
     this.bumpGeneration();
     // 2. 生成中のリクエストを取り消す（取り消せなくても、世代が違う応答は使われない）
@@ -390,11 +468,13 @@ export class ConversationEngine {
       this.ensureNext();
       this.loop();
     } else {
-      this.io.setStatus('error');
+      this.setStatus('error');
     }
   }
 
   reset() {
+    this.held = false;
+    this.shownStatus = null;
     this.bumpGeneration();
     if (this.inflight) this.inflight.controller?.abort();
     this.inflight = null;
