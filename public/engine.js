@@ -159,11 +159,15 @@ export class ConversationEngine {
       state = c.after;
       backlog = mergeList(backlog, c.deferred, 5);
     }
-    return { state, recent: recent.slice(-RECENT), topics: this.ctx.topics, backlog, notes: this.ctx.notes };
+    const ctx = { state, recent: recent.slice(-RECENT), topics: this.ctx.topics, backlog, notes: this.ctx.notes };
+    // 長期記憶から、いまの話題に関係する記憶だけを選んで添える（ブラウザ内の検索なので通信は増えない）
+    const mem = this.io.memoryContext?.({ state, recent: ctx.recent }) || null;
+    return mem ? { ...ctx, ...mem } : ctx;
   }
 
   commitLine(line) {
     this.remember({ kind: 'say', speaker: line.speaker, text: line.text });
+    this.io.onLine?.({ kind: 'say', speaker: line.speaker, text: line.text, type: line.type, phase: line.phase }); // 実際に再生された発言だけを記録する
     this.stats.played++;
   }
 
@@ -175,6 +179,8 @@ export class ConversationEngine {
     this.ctx.backlog = mergeList(this.ctx.backlog, c.deferred, 5);
     for (const w of ['A', 'B']) if (c.notes?.[w]) this.ctx.notes[w] = mergeList(this.ctx.notes[w], [c.notes[w]], 5);
     this.chunksSinceInput++;
+    // 最後まで再生された記録だけを長期記憶にする（割り込みで途中になった記録の要約・出来事は記憶しない）
+    this.io.onChunk?.({ before: c.before, after: c.after, recap: c.recap || '', memos: c.memos || [] });
   }
 
   // ---------- 通信 ----------
@@ -224,7 +230,7 @@ export class ConversationEngine {
     if (!valid) return this.onError(Object.assign({}, req, { stale: true }), { code: 'bad_output', message: '会話の続きの形式が正しくありませんでした。' }, true);
     if (req.interrupt && this.pendingInterrupt === req.interrupt) this.pendingInterrupt = null;
     if (res.mode === 'demo' || res.demo) this.mode = res.demo ? 'demo' : this.mode;
-    this.next = { rid: req.rid, lines: chunk.lines, idx: 0, before: req.before, after: chunk.state, deferred: chunk.deferred || [], notes: chunk.notes || {}, boundary: !!chunk.boundary, prefetched: false };
+    this.next = { rid: req.rid, lines: chunk.lines, idx: 0, before: req.before, after: chunk.state, deferred: chunk.deferred || [], notes: chunk.notes || {}, boundary: !!chunk.boundary, recap: chunk.recap || '', memos: Array.isArray(chunk.memos) ? chunk.memos : [], prefetched: false };
     this.transient = 0;
     this.badOutput = 0;
     this.limitWaits = 0;
@@ -446,7 +452,10 @@ export class ConversationEngine {
     const c = this.current;
     if (c) {
       const sp = this.speaking;
-      if (sp && sp.shown.length >= 4) this.remember({ kind: 'say', speaker: sp.line.speaker, text: `${sp.shown}…` });
+      if (sp && sp.shown.length >= 4) {
+        this.remember({ kind: 'say', speaker: sp.line.speaker, text: `${sp.shown}…` });
+        this.io.onLine?.({ kind: 'say', speaker: sp.line.speaker, text: `${sp.shown}…`, type: sp.line.type, phase: sp.line.phase }); // 聞こえた分だけ
+      }
       // 記録の途中なら、記録の前の状態を使う（まだ話していない結論は含めない）
       this.ctx.state = c.before;
       this.current = null;
@@ -454,6 +463,7 @@ export class ConversationEngine {
     this.speaking = null;
     // 4. 観察者の発言を文脈に加える。生成待ちの間に続けて話しかけられたら、まとめて 1 回で送る
     this.remember({ kind: 'player', speaker: null, text });
+    this.io.onLine?.({ kind: 'player', speaker: null, text });
     this.pendingInterrupt = this.pendingInterrupt ? { text: `${this.pendingInterrupt.text} / ${text}`.slice(-100) } : { text };
     this.chunksSinceInput = 0;
     this.transient = 0;
@@ -473,6 +483,7 @@ export class ConversationEngine {
   }
 
   reset() {
+    this.io.onSessionEnd?.(); // 途中の問題も「途中」として長期記憶に残す
     this.held = false;
     this.shownStatus = null;
     this.bumpGeneration();
@@ -496,7 +507,7 @@ export class ConversationEngine {
   // ---------- 保存（このタブの sessionStorage だけ） ----------
 
   snapshot() {
-    const keep = (c) => c && { rid: c.rid, lines: c.lines, idx: c.idx, before: c.before, after: c.after, deferred: c.deferred, notes: c.notes, boundary: c.boundary };
+    const keep = (c) => c && { rid: c.rid, lines: c.lines, idx: c.idx, before: c.before, after: c.after, deferred: c.deferred, notes: c.notes, boundary: c.boundary, recap: c.recap, memos: c.memos };
     return { v: 4, mode: this.mode, ctx: this.ctx, current: keep(this.current), next: keep(this.next), started: this.started, chunksSinceInput: this.chunksSinceInput };
   }
 

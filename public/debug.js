@@ -2,7 +2,7 @@
 // 画面の表示領域・安全領域・キーボード・入力状態・会話の状態を、画面の隅に表示する。
 // 最初は 1 行に畳んで表示する（ゲームの操作を邪魔しない）。タップで広げる / 畳む。長押し（0.6 秒）で内容をクリップボードにコピーする。
 
-export function startDebug({ el, engine, presence, events, measureKeyboard, keyboardAdjust }) {
+export function startDebug({ el, engine, presence, memory, events, measureKeyboard, keyboardAdjust }) {
   // env(safe-area-inset-*) の実際の値を読むための、見えない要素
   const probe = document.createElement('div');
   probe.className = 'debug-probe';
@@ -63,6 +63,7 @@ export function startDebug({ el, engine, presence, events, measureKeyboard, keyb
       ['input state', `focused=${ps.focused} typing=${presence.typing} holding=${ps.holding} composing=${ps.composing} hidden=${ps.hidden} sending=${ps.sending} suppressed=${ps.suppressed}`],
       ['engine', `running=${engine.running} held=${engine.held} status=${el.status.dataset.state} current=${engine.current ? `${engine.current.idx}/${engine.current.lines.length}` : '-'} next=${engine.next ? engine.next.lines.length : '-'} inflight=${engine.inflight ? engine.inflight.rid : '-'}`],
       ['activeElement', document.activeElement?.id || document.activeElement?.tagName || '-'],
+      ['memory', memory ? (() => { const m = memory.stats(); return `records=${m.records} lines=${m.lines} open-segment=${m.segment || '-'} ${JSON.stringify(m.byKind)}`; })() : '-'],
       ['orientation', `${screen.orientation?.type || (innerWidth > innerHeight ? 'landscape' : 'portrait')} dpr=${devicePixelRatio}`],
     ];
   }

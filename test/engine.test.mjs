@@ -479,3 +479,41 @@ test('pause and hold together: releasing while paused stays paused; a pending re
   await until(() => log.requests.length >= 3);
   engine.pause();
 });
+
+test('memory hooks: played lines are logged, recap/memo are committed only for fully played chunks, memories are sent with requests', async () => {
+  const { engine, log } = harness({ playMs: 40 });
+  const mem = { lines: [], chunks: [], asked: 0, ended: 0 };
+  Object.assign(engine.io, {
+    onLine: (l) => mem.lines.push(l),
+    onChunk: (c) => mem.chunks.push(c),
+    memoryContext: () => (mem.asked++, { memories: [{ kind: 'joke', text: 'ガウス少年' }], quizzes: ['1から100の和'], recentKinds: ['クイズ'] }),
+    onSessionEnd: () => mem.ended++,
+  });
+  engine.start();
+  await until(() => log.requests.length === 1);
+  assert.deepEqual(log.requests[0].body.context.memories, [{ kind: 'joke', text: 'ガウス少年' }]);
+  assert.deepEqual(log.requests[0].body.context.quizzes, ['1から100の和']);
+  const r0 = log.requests[0];
+  r0.resolve({ chunk: { lines: ['A-1 一つ目', 'A-2 二つ目', 'A-3 三つ目'].map((t, i) => line(i % 2 ? 'B' : 'A', t)), state: state({ question: 'Q', status: 'exploring', phase: 'EXPLORATION' }), deferred: [], notes: {}, boundary: false, recap: '', memos: [{ kind: 'hypothesis', text: '完全に再生された仮説' }] }, gen: r0.body.gen, rid: r0.body.rid, demo: false, calls: 1 });
+  await until(() => log.requests.length === 2);
+  const r1 = log.requests[1];
+  r1.resolve({ chunk: { lines: ['B-1 四つ目', 'B-2 五つ目', 'B-3 六つ目'].map((t, i) => line(i % 2 ? 'B' : 'A', t)), state: state({ question: 'Q', status: 'resolved', phase: 'RESOLUTION' }), deferred: [], notes: {}, boundary: true, recap: '再生されなかった要約', memos: [{ kind: 'quiz', text: '再生されなかった出来事' }] }, gen: r1.body.gen, rid: r1.body.rid, demo: false, calls: 1 });
+  await until(() => log.played.includes('B-1 四つ目'));
+  await until(() => log.progress.some((p) => p.text.startsWith('B-2') && p.n >= 5));
+  engine.interrupt('ちょっと待って');
+  await tick(5);
+  // 最後まで再生された 1 つ目の記録だけが記憶に渡る
+  assert.equal(mem.chunks.length, 1);
+  assert.deepEqual(mem.chunks[0].memos, [{ kind: 'hypothesis', text: '完全に再生された仮説' }]);
+  assert.ok(!JSON.stringify(mem.chunks).includes('再生されなかった'));
+  // 発言ログ: 再生された発言、聞こえた分だけの途中の発言、観察者の発言
+  const texts = mem.lines.map((l) => l.text);
+  assert.deepEqual(texts.slice(0, 4), ['A-1 一つ目', 'A-2 二つ目', 'A-3 三つ目', 'B-1 四つ目']);
+  assert.match(texts[4], /^B-2.*…$/);
+  assert.equal(texts.at(-1), 'ちょっと待って');
+  assert.ok(!texts.includes('B-3 六つ目'));
+  assert.ok(mem.asked >= 2);
+  engine.pause();
+  engine.reset();
+  assert.equal(mem.ended, 1);
+});

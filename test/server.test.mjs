@@ -168,6 +168,27 @@ test('one Gemini call returns several lines (standard 3) plus the updated conver
   assert.match(user, /原則 3 つ（2〜5 つ）/);
 });
 
+test('long-term memories in the context are capped and reach the prompt; recap and memo come back with the chunk', async () => {
+  requests.length = 0;
+  queue.push(geminiOk(episode([line('B', 'クイズ。1から100まで足すと？', { tag: 'DISCOVERY discovery' }), line('A', '前のガウス少年の話だね', { tag: 'DISCOVERY joke' }), line('B', 'そう。でも今度は奇数だけ', { tag: 'DISCOVERY discovery' })], { question: '1から99までの奇数の和', kind: 'クイズ', status: 'exploring', known_answer: '2500', hints: '', recap: '', memo: 'クイズ: 奇数の和を出題 / 冗談: ガウス少年ふたたび' })));
+  const big = 'あ'.repeat(300);
+  const memories = Array.from({ length: 30 }, (_, i) => ({ kind: i % 2 ? 'joke' : 'topic', when: '昨日', topic: `話題${i}`, question: `問い${i}${big}`, status: 'resolved', text: big, conclusion: big, open: big, leo: big, mina: big, excerpt: Array(9).fill({ kind: 'say', speaker: 'A', text: big }) }));
+  memories[0] = { kind: 'topic', when: '3日前', topic: '数の和', question: '1から100の和', status: 'resolved', text: 'レオが組にして5050と導いた', conclusion: '5050' };
+  const body = { gen: 1, rid: 1, context: { state: { phase: 'FREE', free_run: 2 }, recent: [{ kind: 'say', speaker: 'A', text: '数字の話をしよう' }], memories, quizzes: Array(40).fill('1から100の和'), recentKinds: ['クイズ'] } };
+  body.context.memories = memories.slice(0, 3).map((m) => ({ ...m, excerpt: (m.excerpt || []).slice(0, 2) })); // 上限を超える長さの項目はサーバーで切る
+  assert.ok(Buffer.byteLength(JSON.stringify(body)) < 32 * 1024);
+  const r = await post(base, body);
+  assert.equal(r.status, 200);
+  const user = requests[0].body.contents[0].parts[0].text;
+  assert.match(user, /# 二人の記憶/);
+  assert.match(user, /\[3日前・解決\] 数の和: 問い「1から100の和」 レオが組にして5050と導いた 結論: 5050/);
+  assert.ok((user.match(/^- \[/gm) || []).length <= 8);
+  assert.ok(user.length < 9000, `prompt length ${user.length}`);
+  assert.match(user, /# ミナが前に出した問題（同じ問題を出さない）/);
+  assert.equal(r.json.chunk.state.known_answer, '2500');
+  assert.deepEqual(r.json.chunk.memos.map((m) => m.kind), ['quiz', 'joke']);
+});
+
 test('the observer interrupt is answered first, with the current problem and both opinions kept', async () => {
   requests.length = 0;
   queue.push(geminiOk(episode([line('B', '観察者さん、それほんと？', { tag: 'EXPLORATION answer_player' }), line('A', 'じゃあ僕の仮説は外れか', { tag: 'EXPLORATION concede' })])));

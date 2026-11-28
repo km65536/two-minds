@@ -4,6 +4,7 @@
 // 文脈（会話の状態・直近の発言・再生中の記録）は、このタブのセッション中だけ sessionStorage に置く。
 import { ConversationEngine } from './engine.js';
 import { InputPresence } from './input-state.js';
+import { MemoryStore } from './memory.js';
 
 const SESSION_KEY = 'twominds:session:v4';
 const PACE_KEY = 'twominds:pace';
@@ -315,6 +316,7 @@ function showOverlay({ title, text, note = '', button, alt = '', action }) {
   el.overlayAlt.textContent = alt;
   el.overlayAlt.hidden = !alt;
   overlayAction = action;
+  $('overlayForget').hidden = !(memory.stats().records || memory.stats().lines);
   el.overlay.hidden = false;
 }
 
@@ -389,6 +391,30 @@ function paceWait({ interrupt = false } = {}) {
 
 // ---------------- 会話エンジン ----------------
 
+// 二人の長期記憶（このブラウザの localStorage にだけ保存する。サーバーには送らない。生成のたびに関係する記憶だけを選んで添える）
+const memory = new MemoryStore({
+  storage: {
+    get: (k) => {
+      try {
+        return localStorage.getItem(k);
+      } catch {
+        return null;
+      }
+    },
+    set: (k, v) => localStorage.setItem(k, v),
+    remove: (k) => {
+      try {
+        localStorage.removeItem(k);
+      } catch {}
+    },
+  },
+});
+let memorySaveTimer = null;
+function saveMemorySoon() {
+  clearTimeout(memorySaveTimer);
+  memorySaveTimer = setTimeout(() => memory.save(), 1000);
+}
+
 function createEngine() {
   return new ConversationEngine(
     {
@@ -413,6 +439,17 @@ function createEngine() {
       },
       paceWait,
       notePace,
+      // 長期記憶：再生された発言を記録し、最後まで再生された記録から記憶を作り、生成のたびに関係する記憶を選ぶ
+      onLine: (line) => {
+        memory.addLine(line);
+        saveMemorySoon();
+      },
+      onChunk: (c) => {
+        memory.onChunkCommitted(c);
+        saveMemorySoon();
+      },
+      memoryContext: (q) => memory.retrieve(q),
+      onSessionEnd: () => memory.endSession(),
       // 観察者が入力を始めたら、話している途中でも口を閉じて止まる（続きは同じ位置から）
       onHold: () => {
         for (const w of ['A', 'B']) el.chars[w].dataset.shape = restShape(el.chars[w].dataset.expr);
@@ -548,6 +585,12 @@ function debugLog(m) {
 function bind() {
   el.overlayBtn.addEventListener('click', () => (overlayAction || play)());
   el.overlayAlt.addEventListener('click', newConversation);
+  $('overlayForget').addEventListener('click', () => {
+    if (!confirm('レオとミナの記憶（これまでの会話の要約と発言の記録）をすべて消します。よろしいですか？')) return;
+    memory.clear();
+    $('overlayForget').hidden = true;
+    notice('二人の記憶を消しました');
+  });
   el.playBtn.addEventListener('click', () => (engine.running ? pause() : play()));
   $('composer').addEventListener('submit', (e) => {
     e.preventDefault();
@@ -567,7 +610,10 @@ function bind() {
       play();
     }
   });
-  window.addEventListener('pagehide', () => engine.save());
+  window.addEventListener('pagehide', () => {
+    engine.save();
+    memory.save();
+  });
 
   if (window.visualViewport) {
     window.visualViewport.addEventListener('resize', syncViewport);
@@ -602,7 +648,7 @@ function restoreBubbles() {
 async function init() {
   engine = createEngine();
   if (new URLSearchParams(location.search).has('debug')) {
-    import('./debug.js').then((m) => m.startDebug({ el, engine, presence, events: debugEvents, measureKeyboard, keyboardAdjust: KEYBOARD_ADJUST })).catch((e) => console.warn('debug', e));
+    import('./debug.js').then((m) => m.startDebug({ el, engine, presence, memory, events: debugEvents, measureKeyboard, keyboardAdjust: KEYBOARD_ADJUST })).catch((e) => console.warn('debug', e));
   }
   bind();
   syncViewport();
